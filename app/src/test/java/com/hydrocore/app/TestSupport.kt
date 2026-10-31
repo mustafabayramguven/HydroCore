@@ -1,6 +1,7 @@
 package com.hydrocore.app
 
 import com.hydrocore.app.domain.EngineResult
+import com.hydrocore.app.domain.HistoryDay
 import com.hydrocore.app.domain.HydrationEntry
 import com.hydrocore.app.domain.HydrationState
 import com.hydrocore.app.domain.Settings
@@ -18,6 +19,7 @@ fun sampleState(
     goal: Int = 2500,
     settings: Settings = Settings(),
     lastSync: String? = null,
+    history: List<HistoryDay> = emptyList(),
 ): HydrationState =
     HydrationState(
         date = "2026-10-31",
@@ -29,6 +31,16 @@ fun sampleState(
         entries = if (intake > 0) listOf(HydrationEntry("2026-10-31T10:00:00Z", intake)) else emptyList(),
         settings = settings,
         lastSyncUtc = lastSync,
+        history = history,
+    )
+
+fun historyDay(date: String, intake: Int, goal: Int = 2500): HistoryDay =
+    HistoryDay(
+        date = date,
+        intakeMl = intake,
+        dailyGoalMl = goal,
+        goalReached = intake >= goal,
+        entries = listOf(HydrationEntry("${date}T10:00:00Z", intake)),
     )
 
 /** Scriptable [com.hydrocore.app.domain.HydrationEngine] that records calls. */

@@ -29,6 +29,8 @@ pub const MIN_GOAL_ML: u32 = 500;
 pub const MAX_GOAL_ML: u32 = 10_000;
 pub const MAX_SINGLE_ADD_ML: u32 = 5_000;
 pub const MAX_DAILY_INTAKE_ML: u32 = 20_000;
+/// Finished days kept for the history view; the oldest are dropped beyond this.
+pub const MAX_HISTORY_DAYS: usize = 365;
 
 const STATE_FILE: &str = "state.json";
 const STATE_TMP_FILE: &str = "state.json.tmp";
@@ -91,7 +93,24 @@ pub struct Entry {
     pub amount_ml: u32,
 }
 
+/// A finished day, archived at rollover (midnight). Intake is derived from `entries`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DayRecord {
+    pub date: String,
+    pub daily_goal_ml: u32,
+    pub entries: Vec<Entry>,
+}
+
+impl DayRecord {
+    pub fn intake_ml(&self) -> u32 {
+        self.entries
+            .iter()
+            .fold(0u32, |acc, e| acc.saturating_add(e.amount_ml))
+    }
+}
+
 /// The persisted state. Intake is always derived from `entries`, so it cannot drift.
+/// `history` is oldest-first on disk; files written by v0.1 simply have none.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -100,6 +119,7 @@ pub struct State {
     pub entries: Vec<Entry>,
     pub settings: Settings,
     pub last_sync_utc: Option<String>,
+    pub history: Vec<DayRecord>,
 }
 
 impl Default for State {
@@ -110,6 +130,7 @@ impl Default for State {
             entries: Vec::new(),
             settings: Settings::default(),
             last_sync_utc: None,
+            history: Vec::new(),
         }
     }
 }
@@ -120,6 +141,16 @@ impl State {
             .iter()
             .fold(0u32, |acc, e| acc.saturating_add(e.amount_ml))
     }
+}
+
+/// A finished day as shown in the history view.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistoryDay {
+    pub date: String,
+    pub intake_ml: u32,
+    pub daily_goal_ml: u32,
+    pub goal_reached: bool,
+    pub entries: Vec<Entry>,
 }
 
 /// What the UI sees: the persisted state plus derived goal-progression values.
@@ -135,6 +166,8 @@ pub struct StateView {
     pub entries: Vec<Entry>,
     pub settings: Settings,
     pub last_sync_utc: Option<String>,
+    /// Finished days, newest first.
+    pub history: Vec<HistoryDay>,
 }
 
 /// A fully prepared sync request, built while holding the lock and sent without it.
@@ -229,12 +262,32 @@ impl Engine {
             entries: self.state.entries.clone(),
             settings: self.state.settings.clone(),
             last_sync_utc: self.state.last_sync_utc.clone(),
+            history: self
+                .state
+                .history
+                .iter()
+                .rev()
+                .map(|d| {
+                    let intake = d.intake_ml();
+                    HistoryDay {
+                        date: d.date.clone(),
+                        intake_ml: intake,
+                        daily_goal_ml: d.daily_goal_ml,
+                        goal_reached: intake >= d.daily_goal_ml,
+                        entries: d.entries.clone(),
+                    }
+                })
+                .collect(),
         }
     }
 
-    /// Starts a new day when `today` is later than the stored date. Returns whether a
+    /// Starts a new day when `today` is later than the stored date, archiving the
+    /// finished day (if anything was logged) into the history. Returns whether a
     /// rollover happened. A clock that moves *backwards* (e.g. travelling west) never
     /// wipes data. ISO dates compare correctly as strings.
+    ///
+    /// The core never runs on its own: this is triggered by the first request after
+    /// midnight (app open/resume, or the foreground midnight tick in the UI).
     pub fn rollover(&mut self, today: &str) -> Result<bool> {
         if !is_valid_date(today) {
             return Err(EngineError::Invalid(format!("invalid date: {today:?}")));
@@ -243,6 +296,18 @@ impl Engine {
             return Ok(false);
         }
         let mut next = self.state.clone();
+        if !next.date.is_empty() && !next.entries.is_empty() {
+            let finished = DayRecord {
+                date: next.date.clone(),
+                daily_goal_ml: next.daily_goal_ml,
+                entries: std::mem::take(&mut next.entries),
+            };
+            next.history.retain(|d| d.date != finished.date);
+            next.history.push(finished);
+            next.history.sort_by(|a, b| a.date.cmp(&b.date));
+            let excess = next.history.len().saturating_sub(MAX_HISTORY_DAYS);
+            next.history.drain(..excess);
+        }
         next.date = today.to_string();
         next.entries.clear();
         self.commit(next)?;
@@ -847,6 +912,148 @@ mod tests {
         s.api_token.clear();
         e.save_settings(s, 2000).unwrap();
         assert_eq!(e.build_sync_request(T1).unwrap().bearer_token, None);
+    }
+
+    // --- history (v0.2) -----------------------------------------------------------
+
+    /// Strictly increasing valid dates, so the rollover always moves forward.
+    fn nth_date(i: usize) -> String {
+        let year = 2000 + i / 336;
+        let idx = i % 336;
+        format!("{year}-{:02}-{:02}", idx / 28 + 1, idx % 28 + 1)
+    }
+
+    #[test]
+    fn midnight_rollover_archives_the_finished_day() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, D1);
+        e.save_settings(Settings::default(), 2000).unwrap();
+        e.add_water(250, T1).unwrap();
+        e.add_water(500, T1).unwrap();
+        assert!(e.view().history.is_empty(), "today is not history yet");
+
+        assert!(e.rollover(D2).unwrap());
+        let v = e.view();
+        assert_eq!(v.intake_ml, 0);
+        assert_eq!(v.history.len(), 1);
+        let day = &v.history[0];
+        assert_eq!(day.date, D1);
+        assert_eq!(day.intake_ml, 750);
+        assert_eq!(day.daily_goal_ml, 2000);
+        assert!(!day.goal_reached);
+        assert_eq!(day.entries.len(), 2);
+    }
+
+    #[test]
+    fn archived_day_reports_goal_reached() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, D1);
+        e.save_settings(Settings::default(), 1000).unwrap();
+        e.add_water(500, T1).unwrap();
+        e.add_water(500, T1).unwrap();
+        e.rollover(D2).unwrap();
+        assert!(e.view().history[0].goal_reached);
+    }
+
+    #[test]
+    fn days_without_intake_are_not_archived() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, D1);
+        e.rollover(D2).unwrap();
+        assert!(e.view().history.is_empty());
+    }
+
+    #[test]
+    fn history_is_newest_first_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, "2026-10-29");
+        e.add_water(100, T1).unwrap();
+        e.rollover("2026-10-30").unwrap();
+        e.add_water(200, T1).unwrap();
+        e.rollover(D1).unwrap();
+        e.add_water(300, T1).unwrap();
+        drop(e);
+
+        let e = open(&dir, D1);
+        let v = e.view();
+        assert_eq!(v.intake_ml, 300);
+        let dates: Vec<_> = v.history.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(dates, ["2026-10-30", "2026-10-29"]);
+        assert_eq!(v.history[0].intake_ml, 200);
+    }
+
+    #[test]
+    fn reset_and_settings_do_not_touch_history() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, D1);
+        e.add_water(400, T1).unwrap();
+        e.rollover(D2).unwrap();
+        e.add_water(100, T1).unwrap();
+        e.reset().unwrap();
+        e.save_settings(settings("https://h.example"), 3000).unwrap();
+        assert_eq!(e.view().history.len(), 1);
+        assert_eq!(e.view().history[0].intake_ml, 400);
+    }
+
+    #[test]
+    fn clock_going_backwards_never_archives_or_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, D2);
+        e.add_water(300, T1).unwrap();
+        assert!(!e.rollover(D1).unwrap());
+        assert!(e.view().history.is_empty());
+        assert_eq!(e.view().intake_ml, 300);
+    }
+
+    #[test]
+    fn history_is_capped_to_the_most_recent_days() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, &nth_date(0));
+        let total = MAX_HISTORY_DAYS + 20;
+        for i in 0..total {
+            e.add_water(100, T1).unwrap();
+            e.rollover(&nth_date(i + 1)).unwrap();
+        }
+        let v = e.view();
+        assert_eq!(v.history.len(), MAX_HISTORY_DAYS);
+        assert_eq!(v.history[0].date, nth_date(total - 1), "newest kept");
+        assert_eq!(
+            v.history.last().unwrap().date,
+            nth_date(total - MAX_HISTORY_DAYS),
+            "oldest beyond the cap dropped"
+        );
+    }
+
+    #[test]
+    fn state_file_from_v0_1_without_history_still_loads() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(STATE_FILE),
+            r#"{"date":"2026-10-31","daily_goal_ml":2500,
+                "entries":[{"timestamp_utc":"2026-10-31T10:00:00Z","amount_ml":250}],
+                "settings":{"user_id":"a","server_url":"","api_token":""},
+                "last_sync_utc":null}"#,
+        )
+        .unwrap();
+        let e = open(&dir, D1);
+        assert_eq!(e.view().intake_ml, 250);
+        assert!(e.view().history.is_empty());
+        assert!(!dir.path().join(STATE_CORRUPT_FILE).exists());
+    }
+
+    #[test]
+    fn dispatch_exposes_history_after_midnight() {
+        let dir = TempDir::new().unwrap();
+        let rt = Runtime::new();
+        let t = MockTransport::new(Ok(200));
+        init(&rt, &t, &dir);
+        call(&rt, &t, serde_json::json!({"cmd":"add","amount_ml":400}));
+        let next_day = serde_json::json!({"cmd":"get_state","today":D2,"now_utc":"2026-11-01T00:00:01Z"});
+        let r: serde_json::Value = serde_json::from_str(&rt.handle(&next_day.to_string(), &t)).unwrap();
+        assert_eq!(r["state"]["intake_ml"], 0);
+        assert_eq!(r["state"]["history"][0]["date"], D1);
+        assert_eq!(r["state"]["history"][0]["intake_ml"], 400);
+        assert_eq!(r["state"]["history"][0]["goal_reached"], false);
     }
 
     // --- runtime / dispatch -----------------------------------------------------

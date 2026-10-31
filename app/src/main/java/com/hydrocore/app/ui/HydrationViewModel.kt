@@ -32,6 +32,8 @@ data class HydrationUiState(
     val state: HydrationState? = null,
     val sync: SyncStatus = SyncStatus.Idle,
     val settingsOpen: Boolean = false,
+    /** Whether the history ("watch back") screen is showing instead of today's screen. */
+    val historyOpen: Boolean = false,
     /** One-shot message for a snackbar; cleared via [HydrationViewModel.messageShown]. */
     val message: String? = null,
 )
@@ -71,6 +73,10 @@ class HydrationViewModel(
     fun openSettings() = _uiState.update { it.copy(settingsOpen = true) }
 
     fun closeSettings() = _uiState.update { it.copy(settingsOpen = false) }
+
+    fun openHistory() = _uiState.update { it.copy(historyOpen = true) }
+
+    fun closeHistory() = _uiState.update { it.copy(historyOpen = false) }
 
     fun saveSettings(settings: Settings, dailyGoalMl: Int) {
         viewModelScope.launch {

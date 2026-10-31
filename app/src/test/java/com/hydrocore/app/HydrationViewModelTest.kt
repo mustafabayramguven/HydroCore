@@ -128,6 +128,33 @@ class HydrationViewModelTest {
     }
 
     @Test
+    fun historyScreenOpensAndCloses() {
+        val vm = viewModel(FakeEngine())
+        assertFalse(vm.uiState.value.historyOpen)
+        vm.openHistory()
+        assertTrue(vm.uiState.value.historyOpen)
+        vm.closeHistory()
+        assertFalse(vm.uiState.value.historyOpen)
+    }
+
+    @Test
+    fun refreshAfterMidnightPublishesArchivedDay() {
+        val engine = FakeEngine(EngineResult.Success(sampleState(intake = 800)))
+        val vm = viewModel(engine)
+        engine.next = EngineResult.Success(
+            sampleState(intake = 0).copy(
+                date = "2026-11-01",
+                history = listOf(historyDay("2026-10-31", 800)),
+            ),
+        )
+        vm.refresh()
+        val state = vm.uiState.value.state!!
+        assertEquals(0, state.intakeMl)
+        assertEquals("2026-10-31", state.history.single().date)
+        assertEquals(800, state.history.single().intakeMl)
+    }
+
+    @Test
     fun invalidSettingsKeepDialogOpen() {
         val engine = FakeEngine()
         val vm = viewModel(engine)

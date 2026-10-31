@@ -1,5 +1,6 @@
 package com.hydrocore.app.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -57,7 +59,6 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HydrationScreen(
     ui: HydrationUiState,
@@ -67,6 +68,41 @@ fun HydrationScreen(
     onOpenSettings: () -> Unit,
     onCloseSettings: () -> Unit,
     onSaveSettings: (Settings, Int) -> Unit,
+    onOpenHistory: () -> Unit,
+    onCloseHistory: () -> Unit,
+    onMessageShown: () -> Unit,
+) {
+    val state = ui.state
+    if (ui.historyOpen && state != null) {
+        // BackHandler uses the predictive back gesture (enableOnBackInvokedCallback).
+        BackHandler(onBack = onCloseHistory)
+        HistoryScreen(state = state, onBack = onCloseHistory)
+    } else {
+        TodayScreen(
+            ui = ui,
+            onAdd = onAdd,
+            onReset = onReset,
+            onSync = onSync,
+            onOpenSettings = onOpenSettings,
+            onCloseSettings = onCloseSettings,
+            onSaveSettings = onSaveSettings,
+            onOpenHistory = onOpenHistory,
+            onMessageShown = onMessageShown,
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TodayScreen(
+    ui: HydrationUiState,
+    onAdd: (Int) -> Unit,
+    onReset: () -> Unit,
+    onSync: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onCloseSettings: () -> Unit,
+    onSaveSettings: (Settings, Int) -> Unit,
+    onOpenHistory: () -> Unit,
     onMessageShown: () -> Unit,
 ) {
     val snackbarHost = remember { SnackbarHostState() }
@@ -83,6 +119,9 @@ fun HydrationScreen(
             CenterAlignedTopAppBar(
                 title = { Text("HydroCore") },
                 actions = {
+                    IconButton(onClick = onOpenHistory) {
+                        Icon(Icons.Filled.DateRange, contentDescription = "History")
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }

@@ -1,6 +1,6 @@
 [package]
 name = "hydrocore"
-version = "1.0.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "HydroCore: local-first hydration engine with manual HTTP sync and a JNI bridge."

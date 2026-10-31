@@ -4,6 +4,16 @@ Open-source Android hydration tracker. All hydration logic runs in a **Rust core
 
 No background work of any kind: no WorkManager, no foreground service, no JobScheduler, no polling.
 
+## What's new in 0.2
+
+**History ("watch back").** Tap the calendar icon on the main screen to see a 7-day chart, summary stats (7-day average, days the goal was met) and a list of past days. Tap a day to expand its individual drinks. Back (including the predictive back gesture) returns to today.
+
+**Midnight save.** Every drink is written to `state.json` the moment you add it. When the date changes at 00:00, the core archives the finished day (total, goal and entries) into the history and starts a fresh day. Because the app has no background component, the archive happens:
+* immediately at 00:00 if the app is open on screen (a foreground-only timer, cancelled when the app stops), or
+* on the next launch/resume otherwise.
+
+Either way the day is stored under its own date, so nothing is lost or mis-dated. Days with no logged drinks are not archived. The last 365 days are kept. Existing 0.1 data is migrated automatically. The sync payload is unchanged, so your server needs no changes.
+
 ## Get the APK (no local tools needed)
 
 1. Push this repository to GitHub.

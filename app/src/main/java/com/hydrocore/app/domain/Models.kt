@@ -21,6 +21,16 @@ data class Settings(
         get() = userId.isNotBlank() && serverUrl.isNotBlank()
 }
 
+/** A finished day, archived by the core at midnight. */
+@Serializable
+data class HistoryDay(
+    val date: String,
+    @SerialName("intake_ml") val intakeMl: Int,
+    @SerialName("daily_goal_ml") val dailyGoalMl: Int,
+    @SerialName("goal_reached") val goalReached: Boolean,
+    val entries: List<HydrationEntry> = emptyList(),
+)
+
 /** The Rust core's view of today. All derived values are computed by the core. */
 @Serializable
 data class HydrationState(
@@ -33,6 +43,8 @@ data class HydrationState(
     val entries: List<HydrationEntry> = emptyList(),
     val settings: Settings = Settings(),
     @SerialName("last_sync_utc") val lastSyncUtc: String? = null,
+    /** Finished days, newest first. */
+    val history: List<HistoryDay> = emptyList(),
 ) {
     val progressPercent: Int
         get() = (progress * 100f).toInt().coerceIn(0, 100)
