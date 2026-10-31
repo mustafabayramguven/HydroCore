@@ -1,0 +1,16 @@
+# Gradle / Android
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+.idea/
+*.iml
+.kotlin/
+
+# Rust
+rust/target/
+rust/Cargo.lock.bak
+
+# Native libraries are produced by CI (cargo-ndk), never committed
+app/src/main/jniLibs/

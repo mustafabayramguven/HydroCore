@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Water droplet, kept inside the 66dp adaptive-icon safe zone. Pure XML: no PNGs. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="@color/ic_launcher_foreground"
+        android:pathData="M54,27 C54,27 37,46 37,58 C37,67.4 44.6,75 54,75 C63.4,75 71,67.4 71,58 C71,46 54,27 54,27 Z" />
+</vector>

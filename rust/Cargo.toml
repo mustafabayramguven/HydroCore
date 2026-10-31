@@ -1,0 +1,30 @@
+[package]
+name = "hydrocore"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "HydroCore: local-first hydration engine with manual HTTP sync and a JNI bridge."
+license = "MIT"
+publish = false
+
+[lib]
+name = "hydrocore"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure-Rust TLS (rustls + webpki-roots): no OpenSSL, so NDK cross-compilation just works.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+# The JNI bridge relies on catch_unwind, so panics must unwind (never "abort").
+panic = "unwind"

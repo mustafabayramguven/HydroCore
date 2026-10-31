@@ -1,0 +1,119 @@
+name: Build HydroCore
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: "27.2.12479018"
+  GRADLE_VERSION: "8.11.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;35.0.0 ndk;${{ env.NDK_VERSION }}"
+
+      - name: Export ANDROID_NDK_HOME
+        run: echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain and Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Rust unit tests (host)
+        working-directory: rust
+        run: cargo test --locked
+
+      - name: Build Rust core for Android (16 KB page aligned)
+        working-directory: rust
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+        run: >
+          cargo ndk
+          -t arm64-v8a
+          -t x86_64
+          --platform 26
+          -o "${{ github.workspace }}/app/src/main/jniLibs"
+          build --release --locked
+
+      - name: Verify 16 KB ELF alignment
+        run: |
+          set -euo pipefail
+          READELF="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          for abi in arm64-v8a x86_64; do
+            so="app/src/main/jniLibs/${abi}/libhydrocore.so"
+            test -f "$so" || { echo "::error::missing $so"; exit 1; }
+            echo "== $so"
+            aligns=$("$READELF" -lW "$so" | awk '$1 == "LOAD" { print $NF }')
+            echo "$aligns"
+            test -n "$aligns" || { echo "::error::no LOAD segments found in $so"; exit 1; }
+            for a in $aligns; do
+              if [ $((a)) -lt 16384 ]; then
+                echo "::error::$so has LOAD segment alignment $a (< 16 KB)"
+                exit 1
+              fi
+            done
+          done
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Kotlin unit tests
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Assemble debug APK
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Stage APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk HydroCore-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HydroCore-debug.apk
+          path: HydroCore-debug.apk
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
