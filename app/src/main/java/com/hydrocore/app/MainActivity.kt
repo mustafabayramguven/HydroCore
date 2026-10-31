@@ -63,6 +63,8 @@ class MainActivity : ComponentActivity() {
                     onSaveSettings = viewModel::saveSettings,
                     onOpenHistory = viewModel::openHistory,
                     onCloseHistory = viewModel::closeHistory,
+                    onExportHistory = viewModel::exportHistory,
+                    onCloseExport = viewModel::closeExport,
                     onMessageShown = viewModel::messageShown,
                 )
             }

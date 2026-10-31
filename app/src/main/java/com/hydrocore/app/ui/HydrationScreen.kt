@@ -70,13 +70,21 @@ fun HydrationScreen(
     onSaveSettings: (Settings, Int) -> Unit,
     onOpenHistory: () -> Unit,
     onCloseHistory: () -> Unit,
+    onExportHistory: () -> Unit = {},
+    onCloseExport: () -> Unit = {},
     onMessageShown: () -> Unit,
 ) {
     val state = ui.state
     if (ui.historyOpen && state != null) {
         // BackHandler uses the predictive back gesture (enableOnBackInvokedCallback).
         BackHandler(onBack = onCloseHistory)
-        HistoryScreen(state = state, onBack = onCloseHistory)
+        HistoryScreen(
+            state = state,
+            exportReport = ui.exportReport,
+            onBack = onCloseHistory,
+            onExport = onExportHistory,
+            onCloseExport = onCloseExport,
+        )
     } else {
         TodayScreen(
             ui = ui,

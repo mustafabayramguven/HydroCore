@@ -65,4 +65,6 @@ class FakeEngine(var next: EngineResult = EngineResult.Success(sampleState())) :
         record("save:${settings.userId}:$dailyGoalMl")
 
     override fun sync() = record("sync")
+
+    override fun exportHistory() = record("export")
 }

@@ -57,6 +57,7 @@ sealed interface EngineResult {
     data class Success(
         override val state: HydrationState,
         val message: String? = null,
+        val report: String? = null,
     ) : EngineResult
 
     data class Failure(

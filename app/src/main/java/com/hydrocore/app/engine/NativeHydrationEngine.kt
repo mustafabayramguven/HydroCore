@@ -34,6 +34,8 @@ class NativeHydrationEngine(
 
     override fun sync(): EngineResult = call("sync")
 
+    override fun exportHistory(): EngineResult = call("export")
+
     private fun call(
         cmd: String,
         extra: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit = {},

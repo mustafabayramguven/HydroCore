@@ -155,6 +155,25 @@ class HydrationViewModelTest {
     }
 
     @Test
+    fun exportHistoryPopulatesReportAndClosesCleanly() {
+        val engine = FakeEngine(
+            EngineResult.Success(
+                sampleState(
+                    intake = 400,
+                    history = listOf(historyDay("2026-10-15", 2000)),
+                ),
+            ),
+        )
+        val vm = viewModel(engine)
+        vm.exportHistory()
+        assertEquals("export", engine.calls.last())
+        val report = vm.uiState.value.exportReport!!
+        assertTrue(report.contains("### 2026-10-15 (16 days ago)"))
+        vm.closeExport()
+        assertNull(vm.uiState.value.exportReport)
+    }
+
+    @Test
     fun invalidSettingsKeepDialogOpen() {
         val engine = FakeEngine()
         val vm = viewModel(engine)

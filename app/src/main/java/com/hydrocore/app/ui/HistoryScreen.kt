@@ -1,7 +1,10 @@
 package com.hydrocore.app.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,13 +12,17 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -24,6 +31,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -35,6 +43,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.hydrocore.app.domain.DayBar
@@ -52,9 +64,16 @@ private const val CHART_HEIGHT_DP = 110f
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HistoryScreen(state: HydrationState, onBack: () -> Unit) {
+fun HistoryScreen(
+    state: HydrationState,
+    exportReport: String? = null,
+    onBack: () -> Unit,
+    onExport: () -> Unit = {},
+    onCloseExport: () -> Unit = {},
+) {
     val bars = remember(state) { History.lastDays(state) }
     val stats = remember(state) { History.stats(state) }
+    val categorized = remember(state) { History.categorize(state) }
 
     Scaffold(
         topBar = {
@@ -63,6 +82,11 @@ fun HistoryScreen(state: HydrationState, onBack: () -> Unit) {
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    TextButton(onClick = onExport) {
+                        Text("Export .txt")
                     }
                 },
             )
@@ -86,10 +110,39 @@ fun HistoryScreen(state: HydrationState, onBack: () -> Unit) {
                     )
                 }
             } else {
-                items(state.history, key = { it.date }) { day -> DayCard(day) }
+                if (categorized.recentLast7Days.isNotEmpty()) {
+                    item { SectionHeader("Recent (last 7 days)") }
+                    items(categorized.recentLast7Days, key = { it.date }) { day -> DayCard(day) }
+                }
+                if (categorized.extendedOlderThan7Days.isNotEmpty()) {
+                    item {
+                        SectionHeader(
+                            "Extended archive (> 7 days ago · ${categorized.extendedOlderThan7Days.size} days)",
+                        )
+                    }
+                    items(categorized.extendedOlderThan7Days, key = { it.date }) { day -> DayCard(day) }
+                }
             }
         }
     }
+
+    if (exportReport != null) {
+        ExportHistoryDialog(
+            date = state.date,
+            report = exportReport,
+            onDismiss = onCloseExport,
+        )
+    }
+}
+
+@Composable
+private fun SectionHeader(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 4.dp),
+    )
 }
 
 @Composable
@@ -140,10 +193,20 @@ private fun WeekChart(bars: List<DayBar>) {
 
 @Composable
 private fun StatsRow(stats: HistoryStats) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-        StatItem(label = "7-day average", value = stats.averageLast7Ml?.let { "$it ml" } ?: "–")
-        StatItem(label = "Goal met", value = "${stats.goalMetDays} / ${stats.recordedDays}")
-        StatItem(label = "Days saved", value = stats.recordedDays.toString())
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+            StatItem(label = "7-day avg", value = stats.averageLast7Ml?.let { "$it ml" } ?: "–")
+            StatItem(label = "30-day avg", value = stats.averageLast30Ml?.let { "$it ml" } ?: "–")
+            StatItem(
+                label = ">7d avg",
+                value = stats.averageExtendedMl?.let { "$it ml" } ?: "–",
+            )
+        }
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+            StatItem(label = "Goal met", value = "${stats.goalMetDays} / ${stats.recordedDays}")
+            StatItem(label = ">7d records", value = "${stats.extendedDaysCount} days")
+            StatItem(label = "Total saved", value = "${stats.recordedDays} days")
+        }
     }
 }
 
@@ -204,6 +267,84 @@ private fun DayCard(day: HistoryDay) {
             }
         }
     }
+}
+
+@Composable
+private fun ExportHistoryDialog(
+    date: String,
+    report: String,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var statusText by rememberSaveable {
+        mutableStateOf("Saved to app storage (hydration_history.txt). You can also save a .txt file anywhere on your phone.")
+    }
+
+    val createDocument = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri ->
+        if (uri != null) {
+            statusText = try {
+                context.contentResolver.openOutputStream(uri)?.use { stream ->
+                    stream.write(report.toByteArray(Charsets.UTF_8))
+                }
+                "Saved .txt file to device."
+            } catch (e: Exception) {
+                "Could not write file: ${e.message}"
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Plain-Text History Export") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = statusText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 160.dp, max = 340.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(12.dp)
+                        .verticalScroll(rememberScrollState())
+                        .horizontalScroll(rememberScrollState()),
+                ) {
+                    Text(
+                        text = report,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(report))
+                        statusText = "Copied plain text to clipboard."
+                    },
+                ) {
+                    Text("Copy")
+                }
+                TextButton(
+                    onClick = { createDocument.launch("hydrocore-history-$date.txt") },
+                ) {
+                    Text("Save .txt")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        },
+    )
 }
 
 private val weekdayFormat: DateTimeFormatter =

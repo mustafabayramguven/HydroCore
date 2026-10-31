@@ -35,6 +35,8 @@ pub const MAX_HISTORY_DAYS: usize = 365;
 const STATE_FILE: &str = "state.json";
 const STATE_TMP_FILE: &str = "state.json.tmp";
 const STATE_CORRUPT_FILE: &str = "state.json.corrupt";
+const HISTORY_TXT_FILE: &str = "hydration_history.txt";
+const HISTORY_TXT_TMP_FILE: &str = "hydration_history.txt.tmp";
 
 // ---------------------------------------------------------------------------------
 // Errors
@@ -209,6 +211,22 @@ pub fn is_valid_date(s: &str) -> bool {
     let month: u32 = s[5..7].parse().unwrap_or(0);
     let day: u32 = s[8..10].parse().unwrap_or(0);
     (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+/// Converts `YYYY-MM-DD` into days since 1970-01-01 (Howard Hinnant's civil algorithm).
+pub fn parse_epoch_days(s: &str) -> Option<i64> {
+    if !is_valid_date(s) {
+        return None;
+    }
+    let y: i64 = s[0..4].parse().ok()?;
+    let m: i64 = s[5..7].parse().ok()?;
+    let d: i64 = s[8..10].parse().ok()?;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
 }
 
 /// Accepts only `http://` / `https://` URLs with a non-empty, whitespace-free remainder.
@@ -396,6 +414,211 @@ impl Engine {
         self.commit(next)
     }
 
+    /// Formats the full historical archive (including records > 7 days old and today's
+    /// live intake) into structured plain-text blocks without truncation.
+    pub fn format_history_report(&self, now_utc: &str) -> String {
+        use std::fmt::Write as _;
+
+        let today_days = parse_epoch_days(&self.state.date).unwrap_or(0);
+        // Newest-first for detailed sections.
+        let mut newest_first: Vec<(&DayRecord, i64)> = self
+            .state
+            .history
+            .iter()
+            .rev()
+            .map(|d| {
+                let age = parse_epoch_days(&d.date)
+                    .map(|days| (today_days - days).max(1))
+                    .unwrap_or(1);
+                (d, age)
+            })
+            .collect();
+        newest_first.sort_by(|a, b| b.0.date.cmp(&a.0.date));
+
+        let extended: Vec<&(&DayRecord, i64)> =
+            newest_first.iter().filter(|(_, age)| *age > 7).collect();
+        let recent_7: Vec<&(&DayRecord, i64)> =
+            newest_first.iter().filter(|(_, age)| *age <= 7).collect();
+        let recent_30: Vec<&(&DayRecord, i64)> =
+            newest_first.iter().filter(|(_, age)| *age <= 30).collect();
+
+        let total_days = newest_first.len();
+        let total_volume: u64 = newest_first
+            .iter()
+            .map(|(d, _)| d.intake_ml() as u64)
+            .sum();
+        let goal_met_days = newest_first
+            .iter()
+            .filter(|(d, _)| d.intake_ml() >= d.daily_goal_ml)
+            .count();
+
+        let avg = |items: &[&(&DayRecord, i64)]| -> Option<u64> {
+            if items.is_empty() {
+                None
+            } else {
+                let sum: u64 = items.iter().map(|(d, _)| d.intake_ml() as u64).sum();
+                Some(sum / items.len() as u64)
+            }
+        };
+        let avg_all = if total_days == 0 {
+            None
+        } else {
+            Some(total_volume / total_days as u64)
+        };
+        let avg_ext = avg(&extended);
+        let avg_30 = avg(&recent_30);
+        let avg_7 = avg(&recent_7);
+
+        let user = if self.state.settings.user_id.is_empty() {
+            "(not set)"
+        } else {
+            self.state.settings.user_id.as_str()
+        };
+
+        let mut out = String::new();
+        let _ = writeln!(out, "# HYDROCORE HISTORICAL HYDRATION REPORT");
+        let _ = writeln!(out, "- Generated (UTC): {now_utc}");
+        let _ = writeln!(out, "- Active Date: {}", self.state.date);
+        let _ = writeln!(out, "- User ID: {user}");
+        let _ = writeln!(out, "- Active Daily Goal: {} ml", self.state.daily_goal_ml);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "## SUMMARY STATISTICS");
+        let _ = writeln!(out, "- Total Archived Days: {total_days}");
+        let _ = writeln!(out, "- Extended Archive (> 7 Days Ago): {} days", extended.len());
+        let _ = writeln!(out, "- Recent Window (Last 7 Days): {} days", recent_7.len());
+        let _ = writeln!(out, "- Total Archived Volume: {total_volume} ml");
+        let _ = writeln!(
+            out,
+            "- All-Time Daily Average: {}",
+            avg_all.map(|v| format!("{v} ml")).unwrap_or_else(|| "N/A".into())
+        );
+        let _ = writeln!(
+            out,
+            "- Extended (> 7 Days) Daily Average: {}",
+            avg_ext.map(|v| format!("{v} ml")).unwrap_or_else(|| "N/A".into())
+        );
+        let _ = writeln!(
+            out,
+            "- Last 30 Days Daily Average: {}",
+            avg_30.map(|v| format!("{v} ml")).unwrap_or_else(|| "N/A".into())
+        );
+        let _ = writeln!(
+            out,
+            "- Last 7 Days Daily Average: {}",
+            avg_7.map(|v| format!("{v} ml")).unwrap_or_else(|| "N/A".into())
+        );
+        let _ = writeln!(out, "- Goal Met: {goal_met_days} / {total_days} days");
+        let _ = writeln!(out);
+
+        let today_intake = self.state.intake_ml();
+        let today_goal = self.state.daily_goal_ml.max(1);
+        let today_pct = (today_intake as u64 * 100) / today_goal as u64;
+        let _ = writeln!(out, "## CURRENT DAY (LIVE / UNARCHIVED)");
+        let _ = writeln!(out, "- Date: {}", self.state.date);
+        let _ = writeln!(
+            out,
+            "- Intake: {today_intake} / {} ml ({today_pct}%)",
+            self.state.daily_goal_ml
+        );
+        if today_intake >= self.state.daily_goal_ml {
+            let _ = writeln!(out, "- Status: GOAL REACHED");
+        } else {
+            let _ = writeln!(
+                out,
+                "- Status: {} ml remaining",
+                self.state.daily_goal_ml - today_intake
+            );
+        }
+        let _ = writeln!(out, "- Entries ({}):", self.state.entries.len());
+        if self.state.entries.is_empty() {
+            let _ = writeln!(out, "  * (no entries logged today)");
+        } else {
+            for entry in &self.state.entries {
+                let _ = writeln!(out, "  * {} : +{} ml", entry.timestamp_utc, entry.amount_ml);
+            }
+        }
+        let _ = writeln!(out);
+
+        let write_day_section = |out: &mut String, title: &str, items: &[&(&DayRecord, i64)]| {
+            let _ = writeln!(out, "## {title}");
+            if items.is_empty() {
+                let _ = writeln!(out, "- (no records in this timespan)");
+                let _ = writeln!(out);
+                return;
+            }
+            for (day, age) in items {
+                let intake = day.intake_ml();
+                let goal = day.daily_goal_ml.max(1);
+                let pct = (intake as u64 * 100) / goal as u64;
+                let _ = writeln!(out, "### {} ({} days ago)", day.date, age);
+                let _ = writeln!(out, "- Total Intake: {intake} ml");
+                let _ = writeln!(out, "- Daily Goal: {} ml", day.daily_goal_ml);
+                if intake >= day.daily_goal_ml {
+                    let _ = writeln!(out, "- Goal Status: GOAL REACHED ({pct}%)");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "- Goal Status: SHORT BY {} ml ({pct}%)",
+                        day.daily_goal_ml - intake
+                    );
+                }
+                let _ = writeln!(out, "- Logged Entries ({}):", day.entries.len());
+                for entry in &day.entries {
+                    let _ =
+                        writeln!(out, "  * {} : +{} ml", entry.timestamp_utc, entry.amount_ml);
+                }
+                let _ = writeln!(out);
+            }
+        };
+
+        write_day_section(
+            &mut out,
+            "EXTENDED HISTORICAL ARCHIVE (> 7 DAYS AGO)",
+            &extended,
+        );
+        write_day_section(&mut out, "RECENT HISTORICAL ARCHIVE (LAST 7 DAYS)", &recent_7);
+
+        let _ = writeln!(out, "## COMPLETE CHRONOLOGICAL LOG (OLDEST TO NEWEST)");
+        if self.state.history.is_empty() {
+            let _ = writeln!(out, "- (no archived days)");
+        } else {
+            for day in &self.state.history {
+                let intake = day.intake_ml();
+                let status = if intake >= day.daily_goal_ml {
+                    "GOAL REACHED"
+                } else {
+                    "BELOW GOAL"
+                };
+                let _ = writeln!(
+                    out,
+                    "- {} : {} / {} ml [{}] ({} entries)",
+                    day.date,
+                    intake,
+                    day.daily_goal_ml,
+                    status,
+                    day.entries.len()
+                );
+            }
+        }
+        out
+    }
+
+    /// Writes `hydration_history.txt` atomically in the engine directory and returns its text.
+    pub fn export_history_file(&self, now_utc: &str) -> Result<String> {
+        let report = self.format_history_report(now_utc);
+        fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join(HISTORY_TXT_TMP_FILE);
+        let dst = self.dir.join(HISTORY_TXT_FILE);
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(report.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, &dst)?;
+        Ok(report)
+    }
+
     /// Persist first, then swap into memory.
     fn commit(&mut self, next: State) -> Result<()> {
         persist_state(&self.dir, &next)?;
@@ -509,6 +732,7 @@ enum Command {
         daily_goal_ml: u32,
     },
     Sync,
+    Export,
 }
 
 #[derive(Serialize)]
@@ -519,6 +743,8 @@ struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<StateView>,
 }
 
@@ -528,6 +754,7 @@ impl Response {
             ok: true,
             error: None,
             message,
+            report: None,
             state: Some(state),
         }
     }
@@ -537,6 +764,7 @@ impl Response {
             ok: false,
             error: Some(error.to_string()),
             message: None,
+            report: None,
             state,
         }
     }
@@ -620,6 +848,26 @@ impl Runtime {
                 .map(|_| Some("Settings saved".to_string()))
             }),
             Command::Sync => self.sync(today, now, transport),
+            Command::Export => {
+                let mut guard = self.lock();
+                let Some(engine) = guard.as_mut() else {
+                    return Response::failure(EngineError::NotInitialized, None);
+                };
+                let outcome = engine
+                    .rollover(today)
+                    .and_then(|_| engine.export_history_file(now));
+                let view = engine.view();
+                match outcome {
+                    Ok(report) => Response {
+                        ok: true,
+                        error: None,
+                        message: Some("History exported to hydration_history.txt".to_string()),
+                        report: Some(report),
+                        state: Some(view),
+                    },
+                    Err(e) => Response::failure(e, Some(view)),
+                }
+            }
         }
     }
 
@@ -1054,6 +1302,56 @@ mod tests {
         assert_eq!(r["state"]["history"][0]["date"], D1);
         assert_eq!(r["state"]["history"][0]["intake_ml"], 400);
         assert_eq!(r["state"]["history"][0]["goal_reached"], false);
+    }
+
+    #[test]
+    fn export_compiles_extended_history_beyond_seven_days_and_writes_txt_file() {
+        let dir = TempDir::new().unwrap();
+        let mut e = open(&dir, "2026-10-15");
+        e.save_settings(settings("https://h.example/sync"), 2000).unwrap();
+        // Day 1: 16 days before 2026-10-31 (> 7 days)
+        e.add_water(500, "2026-10-15T09:00:00Z").unwrap();
+        e.add_water(1600, "2026-10-15T18:00:00Z").unwrap();
+        // Day 2: 10 days before 2026-10-31 (> 7 days)
+        e.rollover("2026-10-21").unwrap();
+        e.add_water(1200, "2026-10-21T12:00:00Z").unwrap();
+        // Day 3: 2 days before 2026-10-31 (within last 7 days)
+        e.rollover("2026-10-29").unwrap();
+        e.add_water(2000, "2026-10-29T15:00:00Z").unwrap();
+        // Active day: 2026-10-31
+        e.rollover(D1).unwrap();
+        e.add_water(300, T1).unwrap();
+
+        let report = e.export_history_file("2026-10-31T22:00:00Z").unwrap();
+        let saved = fs::read_to_string(dir.path().join(HISTORY_TXT_FILE)).unwrap();
+        assert_eq!(report, saved);
+        assert!(!dir.path().join(HISTORY_TXT_TMP_FILE).exists());
+
+        assert!(report.contains("# HYDROCORE HISTORICAL HYDRATION REPORT"));
+        assert!(report.contains("- Total Archived Days: 3"));
+        assert!(report.contains("- Extended Archive (> 7 Days Ago): 2 days"));
+        assert!(report.contains("- Recent Window (Last 7 Days): 1 days"));
+        assert!(report.contains("## EXTENDED HISTORICAL ARCHIVE (> 7 DAYS AGO)"));
+        assert!(report.contains("### 2026-10-21 (10 days ago)"));
+        assert!(report.contains("### 2026-10-15 (16 days ago)"));
+        assert!(report.contains("2026-10-15T09:00:00Z : +500 ml"));
+        assert!(report.contains("2026-10-15T18:00:00Z : +1600 ml"));
+        assert!(report.contains("## RECENT HISTORICAL ARCHIVE (LAST 7 DAYS)"));
+        assert!(report.contains("### 2026-10-29 (2 days ago)"));
+        assert!(report.contains("## COMPLETE CHRONOLOGICAL LOG (OLDEST TO NEWEST)"));
+    }
+
+    #[test]
+    fn dispatch_export_returns_report_and_saves_file() {
+        let dir = TempDir::new().unwrap();
+        let rt = Runtime::new();
+        let t = MockTransport::new(Ok(200));
+        init(&rt, &t, &dir);
+        call(&rt, &t, serde_json::json!({"cmd":"add","amount_ml":500}));
+        let r = call(&rt, &t, serde_json::json!({"cmd":"export"}));
+        assert_eq!(r["ok"], true);
+        assert!(r["report"].as_str().unwrap().contains("# HYDROCORE HISTORICAL HYDRATION REPORT"));
+        assert!(dir.path().join(HISTORY_TXT_FILE).exists());
     }
 
     // --- runtime / dispatch -----------------------------------------------------

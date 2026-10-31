@@ -6,7 +6,9 @@ No background work of any kind: no WorkManager, no foreground service, no JobSch
 
 ## What's new in 0.2
 
-**History ("watch back").** Tap the calendar icon on the main screen to see a 7-day chart, summary stats (7-day average, days the goal was met) and a list of past days. Tap a day to expand its individual drinks. Back (including the predictive back gesture) returns to today.
+**History ("watch back").** Tap the calendar icon on the main screen to see a 7-day chart, summary stats (7-day average, 30-day average, >7-day average, and days the goal was met), and past days categorized into **Recent (last 7 days)** and **Extended archive (> 7 days ago)**. Tap a day to expand its individual drinks. Back (including the predictive back gesture) returns to today.
+
+**Plain-text history export (`Export .txt`).** Tap **Export .txt** on the History screen to compile all archived records (up to 365 days, separating records > 7 days old from the recent 7-day window, plus a complete chronological log and every individual drink entry without truncation) into a structured plain-text report. It writes `hydration_history.txt` atomically in app storage and opens a preview dialog where you can save a `.txt` file (`hydrocore-history-YYYY-MM-DD.txt`) anywhere on your phone or copy the plain text to the clipboard.
 
 **Midnight save.** Every drink is written to `state.json` the moment you add it. When the date changes at 00:00, the core archives the finished day (total, goal and entries) into the history and starts a fresh day. Because the app has no background component, the archive happens:
 * immediately at 00:00 if the app is open on screen (a foreground-only timer, cancelled when the app stops), or

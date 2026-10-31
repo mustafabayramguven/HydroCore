@@ -21,4 +21,10 @@ interface HydrationEngine {
 
     /** Manual sync: a single HTTP POST to the configured server. */
     fun sync(): EngineResult
+
+    /**
+     * Compiles the full multi-week historical hydration archive into structured plain-text
+     * blocks and writes `hydration_history.txt` atomically in the engine directory.
+     */
+    fun exportHistory(): EngineResult
 }

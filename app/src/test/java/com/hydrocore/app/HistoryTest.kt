@@ -62,8 +62,32 @@ class HistoryTest {
     fun statsAverageOnlyCoversFinishedDaysOfLastWeek() {
         val stats = History.stats(state)
         assertEquals((2600 + 1000) / 2, stats.averageLast7Ml)
+        assertEquals((2600 + 1000 + 500) / 3, stats.averageLast30Ml)
+        assertEquals(500, stats.averageExtendedMl)
+        assertEquals(1, stats.extendedDaysCount)
+        assertEquals(4100L, stats.totalVolumeMl)
         assertEquals(1, stats.goalMetDays)
         assertEquals(3, stats.recordedDays)
+    }
+
+    @Test
+    fun categorizeSplitsRecentSevenDaysAndExtendedHistory() {
+        val categorized = History.categorize(state)
+        assertEquals(listOf("2026-10-30", "2026-10-28"), categorized.recentLast7Days.map { it.date })
+        assertEquals(listOf("2026-10-20"), categorized.extendedOlderThan7Days.map { it.date })
+    }
+
+    @Test
+    fun formatPlainTextReportCompilesExtendedHistoryWithoutTruncation() {
+        val report = History.formatPlainTextReport(state, "2026-10-31T22:00:00Z")
+        assertTrue(report.contains("# HYDROCORE HISTORICAL HYDRATION REPORT"))
+        assertTrue(report.contains("- Extended Archive (> 7 Days Ago): 1 days"))
+        assertTrue(report.contains("## EXTENDED HISTORICAL ARCHIVE (> 7 DAYS AGO)"))
+        assertTrue(report.contains("### 2026-10-20 (11 days ago)"))
+        assertTrue(report.contains("## RECENT HISTORICAL ARCHIVE (LAST 7 DAYS)"))
+        assertTrue(report.contains("### 2026-10-30 (1 days ago)"))
+        assertTrue(report.contains("### 2026-10-28 (3 days ago)"))
+        assertTrue(report.contains("## COMPLETE CHRONOLOGICAL LOG (OLDEST TO NEWEST)"))
     }
 
     @Test

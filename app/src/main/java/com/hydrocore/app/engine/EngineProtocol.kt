@@ -15,6 +15,7 @@ internal data class EngineResponse(
     val ok: Boolean,
     val error: String? = null,
     val message: String? = null,
+    val report: String? = null,
     val state: HydrationState? = null,
 )
 
@@ -48,7 +49,7 @@ internal object EngineProtocol {
         }
         return when {
             response.ok && response.state != null ->
-                EngineResult.Success(response.state, response.message)
+                EngineResult.Success(response.state, response.message, response.report)
             response.ok ->
                 EngineResult.Failure("Engine response is missing state")
             else ->

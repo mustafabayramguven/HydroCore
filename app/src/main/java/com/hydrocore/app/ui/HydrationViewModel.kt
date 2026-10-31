@@ -3,6 +3,7 @@ package com.hydrocore.app.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.hydrocore.app.domain.EngineResult
+import com.hydrocore.app.domain.History
 import com.hydrocore.app.domain.HydrationEngine
 import com.hydrocore.app.domain.HydrationState
 import com.hydrocore.app.domain.Settings
@@ -34,6 +35,8 @@ data class HydrationUiState(
     val settingsOpen: Boolean = false,
     /** Whether the history ("watch back") screen is showing instead of today's screen. */
     val historyOpen: Boolean = false,
+    /** Non-null when the plain-text history export sheet/dialog is open. */
+    val exportReport: String? = null,
     /** One-shot message for a snackbar; cleared via [HydrationViewModel.messageShown]. */
     val message: String? = null,
 )
@@ -76,7 +79,28 @@ class HydrationViewModel(
 
     fun openHistory() = _uiState.update { it.copy(historyOpen = true) }
 
-    fun closeHistory() = _uiState.update { it.copy(historyOpen = false) }
+    fun closeHistory() = _uiState.update { it.copy(historyOpen = false, exportReport = null) }
+
+    fun exportHistory() {
+        viewModelScope.launch {
+            val result = commands.withLock {
+                withContext(io) { engine.exportHistory() }
+            }
+            _uiState.update { current ->
+                val updatedState = result.state ?: current.state
+                when (result) {
+                    is EngineResult.Success -> {
+                        val report = result.report ?: History.formatPlainTextReport(result.state)
+                        current.copy(state = updatedState, exportReport = report)
+                    }
+                    is EngineResult.Failure ->
+                        current.copy(state = updatedState, message = result.error)
+                }
+            }
+        }
+    }
+
+    fun closeExport() = _uiState.update { it.copy(exportReport = null) }
 
     fun saveSettings(settings: Settings, dailyGoalMl: Int) {
         viewModelScope.launch {
