@@ -1,7 +1,10 @@
 package com.hydrocore.app
 
+import androidx.work.ListenableWorker
 import com.hydrocore.app.domain.EngineResult
 import com.hydrocore.app.domain.Settings
+import com.hydrocore.app.sync.MidnightSyncWorker
+import com.hydrocore.app.sync.SyncScheduler
 import com.hydrocore.app.ui.HydrationViewModel
 import com.hydrocore.app.ui.SyncStatus
 import kotlinx.coroutines.Dispatchers
@@ -182,5 +185,80 @@ class HydrationViewModelTest {
         vm.saveSettings(Settings("a", "ftp://x", ""), 2000)
         assertTrue(vm.uiState.value.settingsOpen)
         assertEquals("server URL must start with http:// or https://", vm.uiState.value.message)
+    }
+
+    @Test
+    fun refreshAfterMidnightAutoSyncsWhenConfiguredAndQueuesOfflineRetryOnFailure() {
+        var midnightScheduled = 0
+        var retryQueued = 0
+        var retryCancelled = 0
+        val scheduler = object : SyncScheduler {
+            override fun scheduleMidnightSync() {
+                midnightScheduled++
+            }
+            override fun enqueuePendingSyncRetry() {
+                retryQueued++
+            }
+            override fun cancelPendingSyncRetry() {
+                retryCancelled++
+            }
+        }
+        val engine = FakeEngine(EngineResult.Success(sampleState(intake = 800, settings = configured)))
+        val vm = HydrationViewModel(engine, "/data", dispatcher, scheduler)
+        assertEquals(1, midnightScheduled)
+
+        // Rollover into 2026-11-01 archives 2026-10-31 (unsynced) and triggers automatic sync.
+        val rolledState = sampleState(intake = 0, settings = configured).copy(
+            date = "2026-11-01",
+            history = listOf(historyDay("2026-10-31", 800)),
+        )
+        engine.next = EngineResult.Success(rolledState, message = "Synced 1 entries (1 history days)")
+        vm.refresh()
+        assertEquals(listOf("init:/data", "load", "sync"), engine.calls)
+        assertEquals(1, retryCancelled)
+
+        // If sync fails (e.g. offline at midnight), a network-constrained retry is queued.
+        engine.next = EngineResult.Failure("network error: offline", rolledState)
+        vm.sync()
+        assertEquals(1, retryQueued)
+    }
+
+    @Test
+    fun midnightWorkerFinalizesDayAndSyncsOrRetriesWhenOffline() {
+        var retryQueued = 0
+        var retryCancelled = 0
+        val scheduler = object : SyncScheduler {
+            override fun scheduleMidnightSync() = Unit
+            override fun enqueuePendingSyncRetry() {
+                retryQueued++
+            }
+            override fun cancelPendingSyncRetry() {
+                retryCancelled++
+            }
+        }
+        val engine = FakeEngine(EngineResult.Success(sampleState(intake = 0, settings = configured)))
+        val ok = MidnightSyncWorker.runMidnightRolloverAndSync(engine, "/data", scheduler)
+        assertEquals(ListenableWorker.Result.success(), ok)
+        assertEquals(listOf("init:/data", "sync"), engine.calls)
+        assertEquals(1, retryCancelled)
+
+        engine.calls.clear()
+        engine.next = EngineResult.Failure("network error: offline", sampleState(settings = configured))
+        // init still succeeds, sync fails:
+        var step = 0
+        val offlineEngine = object : com.hydrocore.app.domain.HydrationEngine by engine {
+            override fun initialize(dataDir: String): EngineResult {
+                step++
+                return EngineResult.Success(sampleState(settings = configured))
+            }
+            override fun sync(): EngineResult {
+                step++
+                return EngineResult.Failure("network error: offline")
+            }
+        }
+        val retry = MidnightSyncWorker.runMidnightRolloverAndSync(offlineEngine, "/data", scheduler)
+        assertEquals(ListenableWorker.Result.retry(), retry)
+        assertEquals(2, step)
+        assertEquals(1, retryQueued)
     }
 }

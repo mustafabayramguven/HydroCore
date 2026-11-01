@@ -28,4 +28,31 @@ class ModelsTest {
         assertEquals(50, sampleState(intake = 1250).progressPercent)
         assertEquals(100, sampleState(intake = 9000).progressPercent)
     }
+
+    @Test
+    fun serverUrlValidationAndNormalizationTargetApiSync() {
+        assertTrue(Settings.isValidServerUrl("https://hydro.example.com"))
+        assertTrue(Settings.isValidServerUrl("http://192.168.1.10:8080/"))
+        assertTrue(Settings.isValidServerUrl("https://hydro.example.com/api/sync"))
+        assertFalse(Settings.isValidServerUrl("ftp://hydro.example.com"))
+        assertFalse(Settings.isValidServerUrl("https://"))
+        assertFalse(Settings.isValidServerUrl("https:///api/sync"))
+
+        assertEquals(
+            "https://hydro.example.com/api/sync",
+            Settings.normalizeServerUrl("https://hydro.example.com"),
+        )
+        assertEquals(
+            "http://192.168.1.10:8080/api/sync",
+            Settings.normalizeServerUrl("http://192.168.1.10:8080/"),
+        )
+        assertEquals(
+            "https://hydro.example.com/api/sync",
+            Settings.normalizeServerUrl("https://hydro.example.com/api"),
+        )
+        assertEquals(
+            "https://hydro.example.com/api/sync",
+            Settings.normalizeServerUrl("https://hydro.example.com/api/sync/"),
+        )
+    }
 }

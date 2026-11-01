@@ -101,6 +101,9 @@ pub struct DayRecord {
     pub date: String,
     pub daily_goal_ml: u32,
     pub entries: Vec<Entry>,
+    /// Whether this archived day has been confirmed synced to the configured server.
+    #[serde(default)]
+    pub synced: bool,
 }
 
 impl DayRecord {
@@ -122,6 +125,8 @@ pub struct State {
     pub settings: Settings,
     pub last_sync_utc: Option<String>,
     pub history: Vec<DayRecord>,
+    /// True when today's state or any archived day has unsynced changes.
+    pub pending_sync: bool,
 }
 
 impl Default for State {
@@ -133,6 +138,7 @@ impl Default for State {
             settings: Settings::default(),
             last_sync_utc: None,
             history: Vec::new(),
+            pending_sync: false,
         }
     }
 }
@@ -152,6 +158,7 @@ pub struct HistoryDay {
     pub intake_ml: u32,
     pub daily_goal_ml: u32,
     pub goal_reached: bool,
+    pub synced: bool,
     pub entries: Vec<Entry>,
 }
 
@@ -168,6 +175,8 @@ pub struct StateView {
     pub entries: Vec<Entry>,
     pub settings: Settings,
     pub last_sync_utc: Option<String>,
+    /// True when local intake or archived history has changes not yet synced to the server.
+    pub pending_sync: bool,
     /// Finished days, newest first.
     pub history: Vec<HistoryDay>,
 }
@@ -179,6 +188,16 @@ pub struct SyncRequest {
     pub bearer_token: Option<String>,
     pub body: String,
     pub entry_count: usize,
+    pub history_day_count: usize,
+}
+
+#[derive(Serialize)]
+struct HistorySyncDay<'a> {
+    date: &'a str,
+    intake_ml: u32,
+    daily_goal_ml: u32,
+    timestamp_utc: &'a str,
+    entries: &'a [Entry],
 }
 
 #[derive(Serialize)]
@@ -189,6 +208,7 @@ struct SyncPayload<'a> {
     daily_goal_ml: u32,
     timestamp_utc: &'a str,
     entries: &'a [Entry],
+    history: Vec<HistorySyncDay<'a>>,
 }
 
 // ---------------------------------------------------------------------------------
@@ -229,14 +249,34 @@ pub fn parse_epoch_days(s: &str) -> Option<i64> {
     Some(era * 146097 + doe - 719468)
 }
 
-/// Accepts only `http://` / `https://` URLs with a non-empty, whitespace-free remainder.
+/// Accepts only `http://` / `https://` URLs with a non-empty, whitespace-free host.
 pub fn is_valid_server_url(url: &str) -> bool {
+    let url = url.trim();
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"));
     match rest {
-        Some(r) => !r.is_empty() && !r.starts_with('/') && !r.chars().any(char::is_whitespace),
+        Some(r) => {
+            let host = r.split('/').next().unwrap_or("");
+            !host.is_empty() && !r.chars().any(char::is_whitespace)
+        }
         None => false,
+    }
+}
+
+/// Normalizes a server URL so it targets `/api/sync` whether the user entered a base
+/// URL (`https://hydro.example.com`, `http://192.168.1.10:8080/`) or the full `/api/sync` path.
+pub fn normalize_server_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with("/api/sync") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/api") {
+        format!("{trimmed}/sync")
+    } else {
+        format!("{trimmed}/api/sync")
     }
 }
 
@@ -270,6 +310,8 @@ impl Engine {
     pub fn view(&self) -> StateView {
         let intake = self.state.intake_ml();
         let goal = self.state.daily_goal_ml.max(1);
+        let pending_sync =
+            self.state.pending_sync || self.state.history.iter().any(|d| !d.synced);
         StateView {
             date: self.state.date.clone(),
             intake_ml: intake,
@@ -280,6 +322,7 @@ impl Engine {
             entries: self.state.entries.clone(),
             settings: self.state.settings.clone(),
             last_sync_utc: self.state.last_sync_utc.clone(),
+            pending_sync,
             history: self
                 .state
                 .history
@@ -292,6 +335,7 @@ impl Engine {
                         intake_ml: intake,
                         daily_goal_ml: d.daily_goal_ml,
                         goal_reached: intake >= d.daily_goal_ml,
+                        synced: d.synced,
                         entries: d.entries.clone(),
                     }
                 })
@@ -303,9 +347,6 @@ impl Engine {
     /// finished day (if anything was logged) into the history. Returns whether a
     /// rollover happened. A clock that moves *backwards* (e.g. travelling west) never
     /// wipes data. ISO dates compare correctly as strings.
-    ///
-    /// The core never runs on its own: this is triggered by the first request after
-    /// midnight (app open/resume, or the foreground midnight tick in the UI).
     pub fn rollover(&mut self, today: &str) -> Result<bool> {
         if !is_valid_date(today) {
             return Err(EngineError::Invalid(format!("invalid date: {today:?}")));
@@ -319,12 +360,14 @@ impl Engine {
                 date: next.date.clone(),
                 daily_goal_ml: next.daily_goal_ml,
                 entries: std::mem::take(&mut next.entries),
+                synced: false,
             };
             next.history.retain(|d| d.date != finished.date);
             next.history.push(finished);
             next.history.sort_by(|a, b| a.date.cmp(&b.date));
             let excess = next.history.len().saturating_sub(MAX_HISTORY_DAYS);
             next.history.drain(..excess);
+            next.pending_sync = true;
         }
         next.date = today.to_string();
         next.entries.clear();
@@ -348,6 +391,7 @@ impl Engine {
             timestamp_utc: now_utc.to_string(),
             amount_ml,
         });
+        next.pending_sync = true;
         self.commit(next)
     }
 
@@ -355,6 +399,7 @@ impl Engine {
     pub fn reset(&mut self) -> Result<()> {
         let mut next = self.state.clone();
         next.entries.clear();
+        next.pending_sync = true;
         self.commit(next)
     }
 
@@ -364,23 +409,38 @@ impl Engine {
                 "daily goal must be between {MIN_GOAL_ML} and {MAX_GOAL_ML} ml"
             )));
         }
-        let server_url = settings.server_url.trim().to_string();
-        if !server_url.is_empty() && !is_valid_server_url(&server_url) {
+        let raw_url = settings.server_url.trim();
+        if !raw_url.is_empty() && !is_valid_server_url(raw_url) {
             return Err(EngineError::Invalid(
                 "server URL must start with http:// or https://".into(),
             ));
         }
+        let server_url = normalize_server_url(raw_url);
+        let user_id = settings.user_id.trim().to_string();
+        let api_token = settings.api_token.trim().to_string();
+
         let mut next = self.state.clone();
+        let target_changed =
+            next.settings.user_id != user_id || next.settings.server_url != server_url;
         next.settings = Settings {
-            user_id: settings.user_id.trim().to_string(),
+            user_id,
             server_url,
-            api_token: settings.api_token.trim().to_string(),
+            api_token,
         };
         next.daily_goal_ml = daily_goal_ml;
+        if target_changed {
+            for day in &mut next.history {
+                day.synced = false;
+            }
+            if !next.entries.is_empty() || !next.history.is_empty() {
+                next.pending_sync = true;
+            }
+        }
         self.commit(next)
     }
 
-    /// Builds the sync request (JSON body, URL, optional bearer token).
+    /// Builds the sync request (JSON body including archived history, normalized `/api/sync`
+    /// URL, and optional bearer token).
     pub fn build_sync_request(&self, now_utc: &str) -> Result<SyncRequest> {
         let s = &self.state.settings;
         if s.user_id.trim().is_empty() {
@@ -391,6 +451,19 @@ impl Engine {
                 "set a valid Server URL (http:// or https://) in Settings first".into(),
             ));
         }
+        let history: Vec<HistorySyncDay<'_>> = self
+            .state
+            .history
+            .iter()
+            .map(|d| HistorySyncDay {
+                date: &d.date,
+                intake_ml: d.intake_ml(),
+                daily_goal_ml: d.daily_goal_ml,
+                timestamp_utc: now_utc,
+                entries: &d.entries,
+            })
+            .collect();
+        let history_entries: usize = self.state.history.iter().map(|d| d.entries.len()).sum();
         let payload = SyncPayload {
             user_id: &s.user_id,
             date: &self.state.date,
@@ -398,19 +471,25 @@ impl Engine {
             daily_goal_ml: self.state.daily_goal_ml,
             timestamp_utc: now_utc,
             entries: &self.state.entries,
+            history,
         };
         let token = s.api_token.trim();
         Ok(SyncRequest {
-            url: s.server_url.trim().to_string(),
+            url: normalize_server_url(&s.server_url),
             bearer_token: (!token.is_empty()).then(|| token.to_string()),
             body: serde_json::to_string(&payload)?,
-            entry_count: self.state.entries.len(),
+            entry_count: self.state.entries.len() + history_entries,
+            history_day_count: self.state.history.len(),
         })
     }
 
     pub fn record_sync_success(&mut self, now_utc: &str) -> Result<()> {
         let mut next = self.state.clone();
         next.last_sync_utc = Some(now_utc.to_string());
+        next.pending_sync = false;
+        for day in &mut next.history {
+            day.synced = true;
+        }
         self.commit(next)
     }
 
@@ -636,6 +715,16 @@ fn load_state(dir: &Path) -> State {
     match serde_json::from_slice::<State>(&raw) {
         Ok(mut state) => {
             state.daily_goal_ml = state.daily_goal_ml.clamp(MIN_GOAL_ML, MAX_GOAL_ML);
+            if !state.settings.server_url.trim().is_empty()
+                && is_valid_server_url(&state.settings.server_url)
+            {
+                state.settings.server_url = normalize_server_url(&state.settings.server_url);
+            }
+            if state.history.iter().any(|d| !d.synced)
+                || (state.last_sync_utc.is_none() && !state.entries.is_empty())
+            {
+                state.pending_sync = true;
+            }
             state
         }
         Err(_) => {
@@ -668,12 +757,45 @@ fn persist_state(dir: &Path, state: &State) -> Result<()> {
 // Networking
 // ---------------------------------------------------------------------------------
 
+pub const MAX_REDIRECTS: usize = 5;
+
+/// Resolves an HTTP `Location` header (absolute or relative) against `current_url`.
+pub fn resolve_redirect_url(current_url: &str, location: &str) -> Result<String> {
+    let loc = location.trim();
+    if loc.is_empty() {
+        return Err(EngineError::Network("empty redirect Location header".into()));
+    }
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        if !is_valid_server_url(loc) {
+            return Err(EngineError::Network(format!("invalid redirect URL: {loc}")));
+        }
+        return Ok(loc.to_string());
+    }
+    let (scheme, rest) = current_url
+        .split_once("://")
+        .ok_or_else(|| EngineError::Network("malformed base URL".into()))?;
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    if loc.starts_with('/') {
+        Ok(format!("{scheme}://{authority}{loc}"))
+    } else {
+        let base_dir = match path.rfind('/') {
+            Some(idx) => &path[..=idx],
+            None => "/",
+        };
+        Ok(format!("{scheme}://{authority}{base_dir}{loc}"))
+    }
+}
+
 pub trait Transport {
     /// POSTs `body` as JSON and returns the HTTP status code.
     fn post_json(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<u16>;
 }
 
-/// Blocking pure-Rust (rustls) HTTP client.
+/// Blocking pure-Rust (rustls) HTTP client that follows HTTP/HTTPS 301/302/307/308
+/// redirects while preserving the POST method, JSON payload, and Bearer token.
 pub struct UreqTransport;
 
 impl Transport for UreqTransport {
@@ -683,22 +805,46 @@ impl Transport for UreqTransport {
             .timeout(Duration::from_secs(20))
             .redirects(0)
             .build();
-        let mut request = agent
-            .post(url)
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json")
-            .set(
-                "User-Agent",
-                concat!("HydroCore/", env!("CARGO_PKG_VERSION")),
-            );
-        if let Some(token) = bearer {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+        let mut current_url = url.to_string();
+        let mut current_bearer = bearer;
+        for hop in 0..=MAX_REDIRECTS {
+            let mut request = agent
+                .post(&current_url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json")
+                .set(
+                    "User-Agent",
+                    concat!("HydroCore/", env!("CARGO_PKG_VERSION")),
+                );
+            if let Some(token) = current_bearer {
+                request = request.set("Authorization", &format!("Bearer {token}"));
+            }
+            let response = match request.send_string(body) {
+                Ok(resp) => resp,
+                Err(ureq::Error::Status(_, resp)) => resp,
+                Err(ureq::Error::Transport(t)) => return Err(EngineError::Network(t.to_string())),
+            };
+            let status = response.status();
+            if matches!(status, 301 | 302 | 307 | 308) {
+                let Some(location) = response.header("Location") else {
+                    return Ok(status);
+                };
+                if hop == MAX_REDIRECTS {
+                    return Err(EngineError::Network(format!(
+                        "too many redirects (>{MAX_REDIRECTS})"
+                    )));
+                }
+                let next_url = resolve_redirect_url(&current_url, location)?;
+                // Never forward the bearer token over plain HTTP after an HTTPS hop.
+                if current_url.starts_with("https://") && next_url.starts_with("http://") {
+                    current_bearer = None;
+                }
+                current_url = next_url;
+                continue;
+            }
+            return Ok(status);
         }
-        match request.send_string(body) {
-            Ok(response) => Ok(response.status()),
-            Err(ureq::Error::Status(code, _)) => Ok(code),
-            Err(ureq::Error::Transport(t)) => Err(EngineError::Network(t.to_string())),
-        }
+        Err(EngineError::Network("too many redirects".into()))
     }
 }
 
@@ -917,10 +1063,17 @@ impl Runtime {
         };
         match status {
             Ok(code) if (200..300).contains(&code) => match engine.record_sync_success(now) {
-                Ok(()) => Response::success(
-                    engine.view(),
-                    Some(format!("Synced {} entries", prepared.entry_count)),
-                ),
+                Ok(()) => {
+                    let msg = if prepared.history_day_count > 0 {
+                        format!(
+                            "Synced {} entries ({} history days)",
+                            prepared.entry_count, prepared.history_day_count
+                        )
+                    } else {
+                        format!("Synced {} entries", prepared.entry_count)
+                    };
+                    Response::success(engine.view(), Some(msg))
+                }
                 Err(e) => Response::failure(e, Some(engine.view())),
             },
             Ok(code) => Response::failure(
@@ -1074,14 +1227,14 @@ mod tests {
         assert!(e.save_settings(settings(""), 2000).is_ok(), "empty URL is allowed");
         let ok = Settings {
             user_id: "  bob ".into(),
-            server_url: " https://h.example/x ".into(),
+            server_url: " https://h.example/ ".into(),
             api_token: " tok ".into(),
         };
         e.save_settings(ok, 2200).unwrap();
         let s = &e.state().settings;
         assert_eq!(
             (s.user_id.as_str(), s.server_url.as_str(), s.api_token.as_str()),
-            ("bob", "https://h.example/x", "tok")
+            ("bob", "https://h.example/api/sync", "tok")
         );
     }
 
@@ -1119,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn date_and_url_validators() {
+    fn date_and_url_validators_and_normalization() {
         assert!(is_valid_date("2026-02-28"));
         assert!(!is_valid_date("2026-2-28"));
         assert!(!is_valid_date("2026-13-01"));
@@ -1127,19 +1280,42 @@ mod tests {
         assert!(!is_valid_date("20261031xx"));
         assert!(!is_valid_date("abcd-ef-gh"));
         assert!(is_valid_server_url("https://a.b"));
-        assert!(is_valid_server_url("http://192.168.1.5:8080/x"));
+        assert!(is_valid_server_url("https://a.b/"));
+        assert!(is_valid_server_url("http://192.168.1.5:8080/api/sync"));
         assert!(!is_valid_server_url("a.b"));
         assert!(!is_valid_server_url("https:///x"));
+        assert!(!is_valid_server_url("https://"));
+
+        assert_eq!(
+            normalize_server_url("https://hydro.example.com"),
+            "https://hydro.example.com/api/sync"
+        );
+        assert_eq!(
+            normalize_server_url("http://192.168.1.10:8080/"),
+            "http://192.168.1.10:8080/api/sync"
+        );
+        assert_eq!(
+            normalize_server_url("https://hydro.example.com/api"),
+            "https://hydro.example.com/api/sync"
+        );
+        assert_eq!(
+            normalize_server_url("https://hydro.example.com/api/sync"),
+            "https://hydro.example.com/api/sync"
+        );
+        assert_eq!(
+            normalize_server_url("https://hydro.example.com/api/sync/"),
+            "https://hydro.example.com/api/sync"
+        );
     }
 
     #[test]
     fn sync_request_contains_required_fields() {
         let dir = TempDir::new().unwrap();
         let mut e = open(&dir, D1);
-        e.save_settings(settings("https://h.example/sync"), 2400).unwrap();
+        e.save_settings(settings("https://h.example"), 2400).unwrap();
         e.add_water(250, T1).unwrap();
         let req = e.build_sync_request("2026-10-31T11:00:00Z").unwrap();
-        assert_eq!(req.url, "https://h.example/sync");
+        assert_eq!(req.url, "https://h.example/api/sync");
         assert_eq!(req.bearer_token.as_deref(), Some("secret"));
         let v: serde_json::Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(v["user_id"], "alice");
@@ -1149,6 +1325,7 @@ mod tests {
         assert_eq!(v["timestamp_utc"], "2026-10-31T11:00:00Z");
         assert_eq!(v["entries"][0]["amount_ml"], 250);
         assert_eq!(v["entries"][0]["timestamp_utc"], T1);
+        assert!(v["history"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1419,7 +1596,7 @@ mod tests {
         assert_eq!(r["state"]["intake_ml"], 250);
 
         let r = call(&rt, &t, serde_json::json!({
-            "cmd":"save_settings","user_id":"alice","server_url":"https://h.example/s",
+            "cmd":"save_settings","user_id":"alice","server_url":"https://h.example",
             "api_token":"tok","daily_goal_ml":3000
         }));
         assert_eq!(r["ok"], true);
@@ -1431,7 +1608,7 @@ mod tests {
         assert_eq!(r["state"]["last_sync_utc"], T1);
         let seen = t.seen.borrow();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].0, "https://h.example/s");
+        assert_eq!(seen[0].0, "https://h.example/api/sync");
         assert_eq!(seen[0].1.as_deref(), Some("tok"));
 
         let r = call(&rt, &t, serde_json::json!({"cmd":"reset"}));
@@ -1587,5 +1764,123 @@ mod tests {
             .post_json(&format!("http://127.0.0.1:{port}/"), None, "{}")
             .unwrap_err();
         assert!(matches!(err, EngineError::Network(_)), "{err:?}");
+    }
+
+    #[test]
+    fn ureq_transport_follows_301_302_307_308_redirects_preserving_post_and_body() {
+        for code in [301u16, 302, 307, 308] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = thread::spawn(move || {
+                // First request receives a redirect to /api/sync
+                let (mut s1, _) = listener.accept().unwrap();
+                s1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf1 = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = s1.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf1.extend_from_slice(&chunk[..n]);
+                    if request_complete(&buf1) {
+                        break;
+                    }
+                }
+                let redir = format!(
+                    "HTTP/1.1 {code} Redirect\r\nLocation: http://{addr}/api/sync\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                s1.write_all(redir.as_bytes()).unwrap();
+                drop(s1);
+
+                // Second request hits the redirected target
+                let (mut s2, _) = listener.accept().unwrap();
+                s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf2 = Vec::new();
+                loop {
+                    let n = s2.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf2.extend_from_slice(&chunk[..n]);
+                    if request_complete(&buf2) {
+                        break;
+                    }
+                }
+                s2.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                String::from_utf8_lossy(&buf2).into_owned()
+            });
+
+            let status = UreqTransport
+                .post_json(
+                    &format!("http://{addr}/legacy"),
+                    Some("tok-redir"),
+                    r#"{"user_id":"alice","intake_ml":500}"#,
+                )
+                .unwrap();
+            assert_eq!(status, 200, "redirect {code}");
+            let raw = handle.join().unwrap();
+            let lower = raw.to_ascii_lowercase();
+            assert!(raw.starts_with("POST /api/sync HTTP/1.1"), "code {code}: {raw}");
+            assert!(lower.contains("authorization: bearer tok-redir"), "code {code}: {raw}");
+            assert!(
+                raw.ends_with(r#"{"user_id":"alice","intake_ml":500}"#),
+                "code {code}: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_includes_full_history_and_midnight_rollover_never_loses_completed_day() {
+        let dir = TempDir::new().unwrap();
+        let rt = Runtime::new();
+        let t = MockTransport::new(Ok(200));
+        init(&rt, &t, &dir);
+        call(
+            &rt,
+            &t,
+            serde_json::json!({
+                "cmd": "save_settings",
+                "user_id": "alice",
+                "server_url": "http://192.168.1.10:8080",
+                "api_token": "tok",
+                "daily_goal_ml": 2500
+            }),
+        );
+        // Log water on D1 (2026-10-31) without syncing yet.
+        call(&rt, &t, serde_json::json!({"cmd":"add","amount_ml":300}));
+        call(&rt, &t, serde_json::json!({"cmd":"add","amount_ml":450}));
+        assert_eq!(
+            call(&rt, &t, serde_json::json!({"cmd":"get_state"}))["state"]["pending_sync"],
+            true
+        );
+
+        // Midnight triggers sync on D2 (2026-11-01): D1 must be finalized in history (750 ml)
+        // and included in the sync payload alongside the new day D2 (0 ml).
+        let midnight_sync = serde_json::json!({
+            "cmd": "sync",
+            "today": D2,
+            "now_utc": "2026-11-01T00:00:01Z"
+        });
+        let r: serde_json::Value =
+            serde_json::from_str(&rt.handle(&midnight_sync.to_string(), &t)).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["state"]["date"], D2);
+        assert_eq!(r["state"]["intake_ml"], 0);
+        assert_eq!(r["state"]["pending_sync"], false);
+        assert_eq!(r["state"]["history"][0]["date"], D1);
+        assert_eq!(r["state"]["history"][0]["intake_ml"], 750);
+        assert_eq!(r["state"]["history"][0]["synced"], true);
+
+        let seen = t.seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "http://192.168.1.10:8080/api/sync");
+        let sent: serde_json::Value = serde_json::from_str(&seen[0].2).unwrap();
+        assert_eq!(sent["date"], D2);
+        assert_eq!(sent["intake_ml"], 0);
+        assert_eq!(sent["history"][0]["date"], D1);
+        assert_eq!(sent["history"][0]["intake_ml"], 750);
+        assert_eq!(sent["history"][0]["entries"].as_array().unwrap().len(), 2);
     }
 }

@@ -1,8 +1,13 @@
 # HydroCore
 
-Open-source Android hydration tracker. All hydration logic runs in a **Rust core**; Kotlin/Jetpack Compose is a thin Material You UI. Data stays on the device and is sent to **your own HTTP server only when you tap "Manual Sync"**.
+Open-source Android hydration tracker (**v0.3**). All hydration logic runs in a **Rust core**; Kotlin/Jetpack Compose is a thin Material You UI. Data stays on the device and syncs to **your own self-hosted companion server** automatically at midnight (`00:00` local time) or whenever you tap **Manual Sync**.
 
-No background work of any kind: no WorkManager, no foreground service, no JobScheduler, no polling.
+## What's new in 0.3
+
+* **Companion Server & URL Normalization (`POST /api/sync`).** Enter either a base URL (`https://hydro.example.com`, `http://192.168.1.10:8080`) or the full `/api/sync` endpoint in Settings; the core automatically normalizes it to `/api/sync`, sends `Authorization: Bearer <token>`, and follows HTTP/HTTPS `301`/`302`/`307`/`308` redirects while preserving the `POST` body and headers.
+* **Full History & Unsynced Days Sync.** Every sync includes the local `history` archive alongside the active day, so past days (or days logged while offline) are never lost.
+* **Automatic Midnight Sync & Offline Resilience.** A nightly `WorkManager` job (`MidnightSyncWorker`) runs at `00:00` local time (complemented by rollover sync on app launch/resume), finalizes and archives the completed day's snapshot into `state.json` before resetting the new day's counter, and syncs it to the companion server. If the device has no internet connection at midnight, a network-constrained retry job (`NetworkType.CONNECTED`) queues automatically and syncs as soon as connectivity returns.
+* **Manual Sync in Settings & Today Screen.** Trigger an immediate full sync and test your server connection directly inside the Settings dialog or from the Today screen.
 
 ## What's new in 0.2
 
@@ -43,7 +48,7 @@ Compose UI ─ HydrationViewModel ─ HydrationEngine (interface)
 
 ## Sync contract
 
-`POST <Server URL>` with `Content-Type: application/json` and, if a token is set, `Authorization: Bearer <token>`:
+`POST <Server URL>/api/sync` with `Content-Type: application/json` and, if a token is set, `Authorization: Bearer <token>`:
 
 ```json
 {
@@ -52,11 +57,20 @@ Compose UI ─ HydrationViewModel ─ HydrationEngine (interface)
   "intake_ml": 750,
   "daily_goal_ml": 2500,
   "timestamp_utc": "2026-10-31T17:00:00Z",
-  "entries": [{ "timestamp_utc": "2026-10-31T10:00:00Z", "amount_ml": 750 }]
+  "entries": [{ "timestamp_utc": "2026-10-31T10:00:00Z", "amount_ml": 750 }],
+  "history": [
+    {
+      "date": "2026-10-30",
+      "intake_ml": 2000,
+      "daily_goal_ml": 2500,
+      "timestamp_utc": "2026-10-31T17:00:00Z",
+      "entries": [{ "timestamp_utc": "2026-10-30T09:00:00Z", "amount_ml": 2000 }]
+    }
+  ]
 }
 ```
 
-Any `2xx` response counts as success. Redirects are not followed.
+Any `2xx` response counts as success. HTTP/HTTPS `301`/`302`/`307`/`308` redirects are followed automatically (up to 5 hops).
 
 ## Notes
 

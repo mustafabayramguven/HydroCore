@@ -10,7 +10,10 @@ data class HydrationEntry(
     @SerialName("amount_ml") val amountMl: Int,
 )
 
-/** Sync configuration. The API token is optional. */
+/**
+ * Sync configuration for the HydroCore companion server (`POST /api/sync` with optional
+ * `Authorization: Bearer <token>`).
+ */
 @Serializable
 data class Settings(
     @SerialName("user_id") val userId: String = "",
@@ -18,7 +21,37 @@ data class Settings(
     @SerialName("api_token") val apiToken: String = "",
 ) {
     val isSyncConfigured: Boolean
-        get() = userId.isNotBlank() && serverUrl.isNotBlank()
+        get() = userId.isNotBlank() && isValidServerUrl(serverUrl)
+
+    val normalizedServerUrl: String
+        get() = normalizeServerUrl(serverUrl)
+
+    companion object {
+        fun isValidServerUrl(url: String): Boolean {
+            val trimmed = url.trim()
+            val rest = when {
+                trimmed.startsWith("https://") -> trimmed.removePrefix("https://")
+                trimmed.startsWith("http://") -> trimmed.removePrefix("http://")
+                else -> return false
+            }
+            val host = rest.substringBefore('/')
+            return host.isNotEmpty() && rest.none(Char::isWhitespace)
+        }
+
+        /**
+         * Normalizes either a base URL (`https://hydro.example.com`, `http://192.168.1.10:8080`)
+         * or a full `/api/sync` path so it always targets `/api/sync`.
+         */
+        fun normalizeServerUrl(url: String): String {
+            val trimmed = url.trim().trimEnd('/')
+            if (trimmed.isEmpty()) return ""
+            return when {
+                trimmed.endsWith("/api/sync") -> trimmed
+                trimmed.endsWith("/api") -> "$trimmed/sync"
+                else -> "$trimmed/api/sync"
+            }
+        }
+    }
 }
 
 /** A finished day, archived by the core at midnight. */
@@ -28,6 +61,7 @@ data class HistoryDay(
     @SerialName("intake_ml") val intakeMl: Int,
     @SerialName("daily_goal_ml") val dailyGoalMl: Int,
     @SerialName("goal_reached") val goalReached: Boolean,
+    val synced: Boolean = false,
     val entries: List<HydrationEntry> = emptyList(),
 )
 
@@ -43,11 +77,15 @@ data class HydrationState(
     val entries: List<HydrationEntry> = emptyList(),
     val settings: Settings = Settings(),
     @SerialName("last_sync_utc") val lastSyncUtc: String? = null,
+    @SerialName("pending_sync") val pendingSync: Boolean = false,
     /** Finished days, newest first. */
     val history: List<HistoryDay> = emptyList(),
 ) {
     val progressPercent: Int
         get() = (progress * 100f).toInt().coerceIn(0, 100)
+
+    val hasUnsyncedHistory: Boolean
+        get() = history.any { !it.synced }
 }
 
 /** Outcome of any engine call. A failure may still carry the latest known state. */
@@ -75,4 +113,5 @@ object QuickAdd {
 object Limits {
     const val MIN_GOAL_ML = 500
     const val MAX_GOAL_ML = 10_000
+    const val APP_VERSION = "0.3"
 }

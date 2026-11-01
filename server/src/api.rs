@@ -71,6 +71,20 @@ struct SyncPayload {
     timestamp_utc: String,
     #[serde(default)]
     entries: Vec<EntryIn>,
+    #[serde(default, alias = "days")]
+    history: Vec<HistoryDayIn>,
+}
+
+#[derive(Deserialize)]
+struct HistoryDayIn {
+    date: String,
+    #[serde(default)]
+    intake_ml: Option<u32>,
+    daily_goal_ml: u32,
+    #[serde(default)]
+    timestamp_utc: Option<String>,
+    #[serde(default)]
+    entries: Vec<EntryIn>,
 }
 
 #[derive(Deserialize)]
@@ -79,27 +93,26 @@ struct EntryIn {
     amount_ml: u32,
 }
 
-fn validate(p: SyncPayload) -> ApiResult<IncomingDay> {
-    let user_id = p.user_id.trim().to_string();
-    if user_id.is_empty() || user_id.chars().count() > MAX_USER_ID_CHARS || user_id.chars().any(char::is_control) {
-        return Err(ApiError::bad(format!(
-            "user_id must be 1-{MAX_USER_ID_CHARS} characters without control characters"
-        )));
-    }
-    if parse_date(&p.date).is_none() {
+fn validate_day(
+    user_id: &str,
+    date: String,
+    intake_ml_opt: Option<u32>,
+    daily_goal_ml: u32,
+    client_ts: String,
+    raw_entries: &[EntryIn],
+) -> ApiResult<IncomingDay> {
+    if parse_date(&date).is_none() {
         return Err(ApiError::bad("date must be a valid YYYY-MM-DD"));
     }
-    if p.daily_goal_ml == 0 || p.daily_goal_ml > MAX_GOAL_ML {
+    if daily_goal_ml == 0 || daily_goal_ml > MAX_GOAL_ML {
         return Err(ApiError::bad(format!("daily_goal_ml must be between 1 and {MAX_GOAL_ML}")));
     }
-    let client_ts = normalize_ts(&p.timestamp_utc)
-        .ok_or_else(|| ApiError::bad("timestamp_utc must be an RFC 3339 timestamp"))?;
-    if p.entries.len() > MAX_ENTRIES {
+    if raw_entries.len() > MAX_ENTRIES {
         return Err(ApiError::bad(format!("at most {MAX_ENTRIES} entries per day")));
     }
-    let mut entries = Vec::with_capacity(p.entries.len());
+    let mut entries = Vec::with_capacity(raw_entries.len());
     let mut sum: u64 = 0;
-    for e in &p.entries {
+    for e in raw_entries {
         if e.amount_ml == 0 || e.amount_ml > MAX_AMOUNT_ML {
             return Err(ApiError::bad(format!("entry amount_ml must be between 1 and {MAX_AMOUNT_ML}")));
         }
@@ -109,38 +122,92 @@ fn validate(p: SyncPayload) -> ApiResult<IncomingDay> {
         entries.push((ts, e.amount_ml));
     }
     // The app derives intake from its entries; do the same so the two can never disagree.
-    let intake = if entries.is_empty() { u64::from(p.intake_ml.unwrap_or(0)) } else { sum };
+    let intake = if entries.is_empty() { u64::from(intake_ml_opt.unwrap_or(0)) } else { sum };
     let intake_ml = u32::try_from(intake).map_err(|_| ApiError::bad("intake_ml is too large"))?;
     Ok(IncomingDay {
-        user_id,
-        date: p.date,
+        user_id: user_id.to_string(),
+        date,
         intake_ml,
-        daily_goal_ml: p.daily_goal_ml,
+        daily_goal_ml,
         client_ts,
         entries,
     })
 }
 
+fn validate(p: SyncPayload) -> ApiResult<(IncomingDay, Vec<IncomingDay>)> {
+    let user_id = p.user_id.trim().to_string();
+    if user_id.is_empty() || user_id.chars().count() > MAX_USER_ID_CHARS || user_id.chars().any(char::is_control) {
+        return Err(ApiError::bad(format!(
+            "user_id must be 1-{MAX_USER_ID_CHARS} characters without control characters"
+        )));
+    }
+    let client_ts = normalize_ts(&p.timestamp_utc)
+        .ok_or_else(|| ApiError::bad("timestamp_utc must be an RFC 3339 timestamp"))?;
+
+    let active = validate_day(
+        &user_id,
+        p.date,
+        p.intake_ml,
+        p.daily_goal_ml,
+        client_ts.clone(),
+        &p.entries,
+    )?;
+
+    let mut history = Vec::with_capacity(p.history.len());
+    for h in p.history {
+        let h_ts = match h.timestamp_utc {
+            Some(ref s) if !s.trim().is_empty() => normalize_ts(s)
+                .ok_or_else(|| ApiError::bad("history timestamp_utc must be an RFC 3339 timestamp"))?,
+            _ => client_ts.clone(),
+        };
+        history.push(validate_day(
+            &user_id,
+            h.date,
+            h.intake_ml,
+            h.daily_goal_ml,
+            h_ts,
+            &h.entries,
+        )?);
+    }
+
+    Ok((active, history))
+}
+
 pub async fn sync(State(state): Shared, body: Bytes) -> ApiResult<Json<Value>> {
     let payload: SyncPayload =
         serde_json::from_slice(&body).map_err(|e| ApiError::bad(format!("invalid JSON body: {e}")))?;
-    let day = validate(payload)?;
+    let (day, history) = validate(payload)?;
     let summary = json!({
         "user_id": day.user_id, "date": day.date,
         "intake_ml": day.intake_ml, "entries": day.entries.len(),
     });
-    let log = (day.user_id.clone(), day.date.clone(), day.intake_ml, day.entries.len());
+    let log = (
+        day.user_id.clone(),
+        day.date.clone(),
+        day.intake_ml,
+        day.entries.len(),
+        history.len(),
+    );
     let outcome = state
         .db
-        .run(move |conn| db::upsert_day(conn, &day, &now_utc()))
+        .run(move |conn| db::upsert_batch(conn, &day, &history, &now_utc()))
         .await
         .map_err(ApiError::internal)?;
-    let (stored, status) = match outcome {
+    let (stored, status) = match outcome.active_outcome {
         UpsertOutcome::Stored => (true, "stored"),
         UpsertOutcome::Stale => (false, "ignored_stale"),
     };
-    tracing::info!("sync user={:?} date={} intake={}ml entries={} -> {status}", log.0, log.1, log.2, log.3);
-    Ok(Json(json!({ "ok": true, "status": status, "stored": stored, "day": summary })))
+    tracing::info!(
+        "sync user={:?} date={} intake={}ml entries={} history_days={} -> {status}",
+        log.0, log.1, log.2, log.3, log.4
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "status": status,
+        "stored": stored,
+        "synced_days": outcome.stored_days,
+        "day": summary,
+    })))
 }
 
 // ---------------------------------------------------------------------------------

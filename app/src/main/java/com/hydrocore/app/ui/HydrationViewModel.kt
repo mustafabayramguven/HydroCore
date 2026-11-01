@@ -7,6 +7,7 @@ import com.hydrocore.app.domain.History
 import com.hydrocore.app.domain.HydrationEngine
 import com.hydrocore.app.domain.HydrationState
 import com.hydrocore.app.domain.Settings
+import com.hydrocore.app.sync.SyncScheduler
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -42,14 +43,15 @@ data class HydrationUiState(
 )
 
 /**
- * Every engine call runs on [io] (the Rust core does disk and network I/O). Nothing here
- * schedules background work: calls happen only in response to a user action or when the
- * screen is shown ([refresh]).
+ * Every engine call runs on [io] (the Rust core does disk and network I/O). Coordinates
+ * user actions, day-rollover syncs on app launch/resume/midnight, and WorkManager
+ * scheduling for nightly 00:00 background sync and offline retry.
  */
 class HydrationViewModel(
     private val engine: HydrationEngine,
     private val dataDir: String,
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    private val syncScheduler: SyncScheduler = SyncScheduler.NoOp,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HydrationUiState())
@@ -59,15 +61,43 @@ class HydrationViewModel(
     private val commands = Mutex()
 
     init {
+        syncScheduler.scheduleMidnightSync()
         viewModelScope.launch {
-            commands.withLock {
-                apply(withContext(io) { engine.initialize(dataDir) })
+            val result = commands.withLock {
+                val r = withContext(io) { engine.initialize(dataDir) }
+                apply(r)
+                r
+            }
+            val state = result.state
+            if (state != null && state.settings.isSyncConfigured && state.hasUnsyncedHistory) {
+                sync()
             }
         }
     }
 
-    /** Re-reads state; applies the daily rollover if midnight passed while the app was away. */
-    fun refresh() = runCommand { engine.load() }
+    /**
+     * Re-reads state; applies the daily rollover if midnight passed while the app was away
+     * (or on the foreground 00:00 tick) and syncs any newly archived history day.
+     */
+    fun refresh() {
+        viewModelScope.launch {
+            val previousDate = _uiState.value.state?.date
+            val result = commands.withLock {
+                val r = withContext(io) { engine.load() }
+                apply(r)
+                r
+            }
+            syncScheduler.scheduleMidnightSync()
+            val newState = result.state
+            val rolledOver = previousDate != null && newState != null && newState.date > previousDate
+            if (newState != null &&
+                newState.settings.isSyncConfigured &&
+                (rolledOver || newState.hasUnsyncedHistory)
+            ) {
+                sync()
+            }
+        }
+    }
 
     fun addWater(amountMl: Int) = runCommand { engine.addWater(amountMl) }
 
@@ -108,13 +138,30 @@ class HydrationViewModel(
                 withContext(io) { engine.saveSettings(settings, dailyGoalMl) }
             }
             apply(result)
-            if (result is EngineResult.Success) closeSettings()
+            if (result is EngineResult.Success) {
+                syncScheduler.scheduleMidnightSync()
+                closeSettings()
+            }
+        }
+    }
+
+    /** Saves the current settings in the Settings dialog and triggers an immediate full sync. */
+    fun saveAndSync(settings: Settings, dailyGoalMl: Int) {
+        viewModelScope.launch {
+            val result = commands.withLock {
+                withContext(io) { engine.saveSettings(settings, dailyGoalMl) }
+            }
+            apply(result)
+            if (result is EngineResult.Success) {
+                syncScheduler.scheduleMidnightSync()
+                sync()
+            }
         }
     }
 
     fun messageShown() = _uiState.update { it.copy(message = null) }
 
-    /** Manual sync, triggered only by the user tapping the button. */
+    /** Full sync of active day and archived history to `POST /api/sync`. */
     fun sync() {
         val current = _uiState.value
         if (current.sync is SyncStatus.InProgress) return
@@ -127,6 +174,15 @@ class HydrationViewModel(
         _uiState.update { it.copy(sync = SyncStatus.InProgress) }
         viewModelScope.launch {
             val result = withContext(io) { engine.sync() }
+            when (result) {
+                is EngineResult.Success -> {
+                    syncScheduler.cancelPendingSyncRetry()
+                    syncScheduler.scheduleMidnightSync()
+                }
+                is EngineResult.Failure -> {
+                    syncScheduler.enqueuePendingSyncRetry()
+                }
+            }
             _uiState.update {
                 it.copy(
                     state = result.state ?: it.state,

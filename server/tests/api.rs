@@ -216,3 +216,58 @@ async fn data_persists_across_restarts() {
     let app = mk();
     assert_eq!(get_json(&app, "/api/days/2026-10-31?user=alice").await["intake_ml"], 300);
 }
+
+#[tokio::test]
+async fn batch_history_sync_and_midnight_rollover_preserve_past_days() {
+    let (app, _d) = app_with(None, None);
+    // Simulate a midnight rollover sync at 2026-11-01T00:00:01Z:
+    // - 2026-10-30 and 2026-10-31 are in `history` with their full completed snapshots
+    // - 2026-11-01 is the new active day with 0 ml and no entries yet
+    let body = json!({
+        "user_id": "alice",
+        "date": "2026-11-01",
+        "intake_ml": 0,
+        "daily_goal_ml": 2500,
+        "timestamp_utc": "2026-11-01T00:00:01Z",
+        "entries": [],
+        "history": [
+            {
+                "date": "2026-10-30",
+                "intake_ml": 2000,
+                "daily_goal_ml": 2500,
+                "timestamp_utc": "2026-11-01T00:00:01Z",
+                "entries": [
+                    { "timestamp_utc": "2026-10-30T09:00:00Z", "amount_ml": 1000 },
+                    { "timestamp_utc": "2026-10-30T18:00:00Z", "amount_ml": 1000 }
+                ]
+            },
+            {
+                "date": "2026-10-31",
+                "intake_ml": 2750,
+                "daily_goal_ml": 2500,
+                "timestamp_utc": "2026-11-01T00:00:01Z",
+                "entries": [
+                    { "timestamp_utc": "2026-10-31T10:00:00Z", "amount_ml": 1250 },
+                    { "timestamp_utc": "2026-10-31T19:00:00Z", "amount_ml": 1500 }
+                ]
+            }
+        ]
+    });
+    let (st, resp) = call(&app, post("/api/sync", &body, None)).await;
+    assert_eq!(st, StatusCode::OK, "{resp}");
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["synced_days"], 2);
+
+    let d30 = get_json(&app, "/api/days/2026-10-30?user=alice").await;
+    assert_eq!(d30["intake_ml"], 2000);
+    assert_eq!(d30["entries"].as_array().unwrap().len(), 2);
+
+    let d31 = get_json(&app, "/api/days/2026-10-31?user=alice").await;
+    assert_eq!(d31["intake_ml"], 2750);
+    assert_eq!(d31["goal_reached"], true);
+    assert_eq!(d31["entries"].as_array().unwrap().len(), 2);
+
+    // And the unstarted new day (2026-11-01 with 0 entries) did not create a bogus 0 ml record.
+    let days = get_json(&app, "/api/days?user=alice").await;
+    assert_eq!(days["days"].as_array().unwrap().len(), 2);
+}

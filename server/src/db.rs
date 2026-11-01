@@ -48,6 +48,13 @@ pub enum UpsertOutcome {
     Stale,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchUpsertOutcome {
+    pub active_outcome: UpsertOutcome,
+    pub stored_days: usize,
+    pub stale_days: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct DayRow {
     pub date: String,
@@ -91,12 +98,11 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)
 }
 
-pub fn upsert_day(
-    conn: &mut Connection,
+fn upsert_day_tx(
+    tx: &rusqlite::Transaction<'_>,
     day: &IncomingDay,
     now_utc: &str,
 ) -> rusqlite::Result<UpsertOutcome> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let existing: Option<String> = tx
         .query_row(
             "SELECT client_ts FROM days WHERE user_id = ?1 AND date = ?2",
@@ -137,8 +143,73 @@ pub fn upsert_day(
             insert.execute(params![day.user_id, day.date, ts, amount])?;
         }
     }
-    tx.commit()?;
     Ok(UpsertOutcome::Stored)
+}
+
+pub fn upsert_day(
+    conn: &mut Connection,
+    day: &IncomingDay,
+    now_utc: &str,
+) -> rusqlite::Result<UpsertOutcome> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = upsert_day_tx(&tx, day, now_utc)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+pub fn upsert_batch(
+    conn: &mut Connection,
+    active: &IncomingDay,
+    history: &[IncomingDay],
+    now_utc: &str,
+) -> rusqlite::Result<BatchUpsertOutcome> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut stored_days = 0usize;
+    let mut stale_days = 0usize;
+
+    for h in history {
+        if h.date == active.date {
+            continue;
+        }
+        match upsert_day_tx(&tx, h, now_utc)? {
+            UpsertOutcome::Stored => stored_days += 1,
+            UpsertOutcome::Stale => stale_days += 1,
+        }
+    }
+
+    // If this sync includes archived history (e.g. a midnight rollover sync) and the new
+    // active day has 0 ml with no entries and is not yet in the database, skip inserting a
+    // 0 ml placeholder for the brand-new day while still allowing a Reset on an existing day.
+    let active_exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM days WHERE user_id = ?1 AND date = ?2",
+            params![active.user_id, active.date],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    let active_outcome = if !history.is_empty()
+        && active.intake_ml == 0
+        && active.entries.is_empty()
+        && !active_exists
+    {
+        UpsertOutcome::Stored
+    } else {
+        let out = upsert_day_tx(&tx, active, now_utc)?;
+        match out {
+            UpsertOutcome::Stored => stored_days += 1,
+            UpsertOutcome::Stale => stale_days += 1,
+        }
+        out
+    };
+
+    tx.commit()?;
+    Ok(BatchUpsertOutcome {
+        active_outcome,
+        stored_days,
+        stale_days,
+    })
 }
 
 pub fn list_users(conn: &Connection) -> rusqlite::Result<Vec<UserRow>> {

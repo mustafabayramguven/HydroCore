@@ -19,7 +19,7 @@ The database lives in the `hydrocore-data` named volume (`/data/hydrocore.db`).
 
 ## Connect the app
 
-In HydroCore settings: **Server URL** `http://<host>:8080/api/sync`, **API token** = `HYDROCORE_API_TOKEN`
+In HydroCore settings: **Companion Server URL** `http://<host>:8080` (or `http://<host>:8080/api/sync` — base URLs are normalized automatically), **Bearer Token** = `HYDROCORE_API_TOKEN`
 (leave empty if you did not set one). Open `http://<host>:8080` for the dashboard.
 
 ## Configuration (environment)
@@ -37,8 +37,8 @@ Basic credentials are otherwise sent in clear text.
 
 ## API
 
-* `POST /api/sync` (or `POST /`): the app's payload, see the root README. The day is stored as a
-  full snapshot per `(user_id, date)`, so re-syncing is idempotent and the app's *Reset*
+* `POST /api/sync` (or `POST /`): the app's payload (active day plus `history` archive), see the root README. Each day is stored as a
+  full snapshot per `(user_id, date)`, so re-syncing is idempotent, full history archives are ingested in one batch transaction, and the app's *Reset*
   propagates. A snapshot older than the stored one is ignored (`"status":"ignored_stale"`).
 * `GET /api/users`, `/api/days?user=&from=&to=`, `/api/days/{date}?user=`,
   `/api/summary?user=&today=`, `/api/export.csv?user=`, `/healthz`.
@@ -50,8 +50,3 @@ cd server
 cargo test
 HYDROCORE_DB=./dev.db HYDROCORE_BIND=127.0.0.1:8080 cargo run
 ```
-
-## Limitation
-
-The app only sends its **current day** on each sync (not its archive), so the server knows
-a day only if you tapped *Manual Sync* on that day.

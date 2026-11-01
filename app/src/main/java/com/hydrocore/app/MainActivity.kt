@@ -14,6 +14,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hydrocore.app.domain.Midnight
 import com.hydrocore.app.engine.NativeHydrationEngine
+import com.hydrocore.app.sync.WorkManagerSyncScheduler
 import com.hydrocore.app.ui.HydrationScreen
 import com.hydrocore.app.ui.HydrationViewModel
 import com.hydrocore.app.ui.theme.HydroCoreTheme
@@ -29,6 +30,7 @@ class MainActivity : ComponentActivity() {
                 HydrationViewModel(
                     engine = NativeHydrationEngine(),
                     dataDir = applicationContext.filesDir.absolutePath,
+                    syncScheduler = WorkManagerSyncScheduler(applicationContext),
                 )
             }
         }
@@ -38,9 +40,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
-        // Foreground-only midnight tick: while the screen is visible, archive the finished
-        // day at 00:00. It is cancelled as soon as the app stops, so there is no background
-        // work; if the app is closed, the next launch/resume performs the rollover instead.
+        // Foreground midnight tick: while the screen is visible, archive the finished day
+        // and sync at 00:00 (complementing WorkManager's background midnight job).
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 while (true) {
@@ -61,6 +62,7 @@ class MainActivity : ComponentActivity() {
                     onOpenSettings = viewModel::openSettings,
                     onCloseSettings = viewModel::closeSettings,
                     onSaveSettings = viewModel::saveSettings,
+                    onSyncFromSettings = viewModel::saveAndSync,
                     onOpenHistory = viewModel::openHistory,
                     onCloseHistory = viewModel::closeHistory,
                     onExportHistory = viewModel::exportHistory,

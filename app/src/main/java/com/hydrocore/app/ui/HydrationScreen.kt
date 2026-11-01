@@ -68,6 +68,10 @@ fun HydrationScreen(
     onOpenSettings: () -> Unit,
     onCloseSettings: () -> Unit,
     onSaveSettings: (Settings, Int) -> Unit,
+    onSyncFromSettings: (Settings, Int) -> Unit = { settings, goal ->
+        onSaveSettings(settings, goal)
+        onSync()
+    },
     onOpenHistory: () -> Unit,
     onCloseHistory: () -> Unit,
     onExportHistory: () -> Unit = {},
@@ -94,6 +98,7 @@ fun HydrationScreen(
             onOpenSettings = onOpenSettings,
             onCloseSettings = onCloseSettings,
             onSaveSettings = onSaveSettings,
+            onSyncFromSettings = onSyncFromSettings,
             onOpenHistory = onOpenHistory,
             onMessageShown = onMessageShown,
         )
@@ -110,6 +115,7 @@ private fun TodayScreen(
     onOpenSettings: () -> Unit,
     onCloseSettings: () -> Unit,
     onSaveSettings: (Settings, Int) -> Unit,
+    onSyncFromSettings: (Settings, Int) -> Unit,
     onOpenHistory: () -> Unit,
     onMessageShown: () -> Unit,
 ) {
@@ -159,8 +165,11 @@ private fun TodayScreen(
         SettingsDialog(
             settings = state.settings,
             dailyGoalMl = state.dailyGoalMl,
+            lastSyncUtc = state.lastSyncUtc,
+            sync = ui.sync,
             onDismiss = onCloseSettings,
             onSave = onSaveSettings,
+            onManualSync = onSyncFromSettings,
         )
     }
 }
@@ -336,8 +345,11 @@ private fun SyncSection(state: HydrationState, sync: SyncStatus, onSync: () -> U
 private fun SettingsDialog(
     settings: Settings,
     dailyGoalMl: Int,
+    lastSyncUtc: String?,
+    sync: SyncStatus,
     onDismiss: () -> Unit,
     onSave: (Settings, Int) -> Unit,
+    onManualSync: (Settings, Int) -> Unit,
 ) {
     var userId by rememberSaveable { mutableStateOf(settings.userId) }
     var serverUrl by rememberSaveable { mutableStateOf(settings.serverUrl) }
@@ -347,12 +359,13 @@ private fun SettingsDialog(
     val goal = goalText.toIntOrNull()
     val goalValid = goal != null && goal in Limits.MIN_GOAL_ML..Limits.MAX_GOAL_ML
     val urlTrimmed = serverUrl.trim()
-    val urlValid = urlTrimmed.isEmpty() ||
-        urlTrimmed.startsWith("http://") || urlTrimmed.startsWith("https://")
+    val urlValid = urlTrimmed.isEmpty() || Settings.isValidServerUrl(urlTrimmed)
+    val canSyncNow = goalValid && userId.isNotBlank() && Settings.isValidServerUrl(urlTrimmed) &&
+        sync !is SyncStatus.InProgress
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Settings") },
+        title = { Text("Settings · v${Limits.APP_VERSION}") },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -380,11 +393,17 @@ private fun SettingsDialog(
                 OutlinedTextField(
                     value = serverUrl,
                     onValueChange = { serverUrl = it },
-                    label = { Text("Server URL") },
-                    placeholder = { Text("https://example.com/hydration") },
+                    label = { Text("Companion Server URL") },
+                    placeholder = { Text("https://hydro.example.com") },
                     isError = !urlValid,
-                    supportingText = if (urlValid) null else {
-                        { Text("Must start with http:// or https://") }
+                    supportingText = {
+                        if (!urlValid) {
+                            Text("Must be a valid http:// or https:// URL")
+                        } else if (urlTrimmed.isNotEmpty()) {
+                            Text("POST ${Settings.normalizeServerUrl(urlTrimmed)} · Auto-syncs at 00:00")
+                        } else {
+                            Text("Base URL or /api/sync · Auto-syncs nightly at 00:00")
+                        }
                     },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
@@ -393,11 +412,50 @@ private fun SettingsDialog(
                 OutlinedTextField(
                     value = apiToken,
                     onValueChange = { apiToken = it },
-                    label = { Text("API Token (optional)") },
+                    label = { Text("Bearer Token (optional)") },
+                    supportingText = { Text("Sent as Authorization: Bearer <token>") },
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedButton(
+                    onClick = {
+                        onManualSync(Settings(userId, serverUrl, apiToken), goal ?: dailyGoalMl)
+                    },
+                    enabled = canSyncNow,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (sync is SyncStatus.InProgress) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                    Spacer(Modifier.size(8.dp))
+                    Text("Manual Sync")
+                }
+                val (statusText, isError) = when (sync) {
+                    SyncStatus.Idle ->
+                        (lastSyncUtc?.let { "Last synced ${formatInstant(it)}" } ?: "Not synced yet") to false
+                    SyncStatus.InProgress -> "Syncing active day and history…" to false
+                    is SyncStatus.Success -> "${sync.message} · ${formatInstant(lastSyncUtc)}" to false
+                    is SyncStatus.Error -> sync.message to true
+                }
+                Text(
+                    text = statusText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isError) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                 )
             }
         },
