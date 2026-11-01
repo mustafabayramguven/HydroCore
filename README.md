@@ -64,10 +64,15 @@ Any `2xx` response counts as success. Redirects are not followed.
 * If the device clock moves backwards (e.g. travelling west), today's data is kept rather than wiped; the rollover only happens when the date moves forward.
 * Plain `http://` is allowed because self-hosted servers on a LAN are a primary use case; prefer `https://` otherwise.
 
+## Companion server
+
+`server/` contains a self-hosted Rust server (SQLite + web dashboard) that receives the sync above. Build and run it with Docker only: see [server/README.md](server/README.md).
+
 ## Layout
 
 ```
 .github/workflows/build.yml   CI: test, build, verify, upload APK
 rust/                         Rust core (lib.rs + tests, jni_bridge.rs, build.rs)
 app/                          Android app (Kotlin, Compose, unit tests)
+server/                       Companion server (Rust, axum, SQLite, Dockerfile, compose)
 ```

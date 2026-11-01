@@ -14,3 +14,7 @@ rust/Cargo.lock.bak
 
 # Native libraries are produced by CI (cargo-ndk), never committed
 app/src/main/jniLibs/
+
+# Companion server
+server/target/
+server/.env
