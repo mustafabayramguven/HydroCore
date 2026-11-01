@@ -80,13 +80,14 @@ Any `2xx` response counts as success. HTTP/HTTPS `301`/`302`/`307`/`308` redirec
 
 ## Companion server
 
-`server/` contains a self-hosted Rust server (SQLite + web dashboard) that receives the sync above. Build and run it with Docker only: see [server/README.md](server/README.md).
+`server/` contains a self-hosted Rust server (SQLite + web dashboard) that receives the sync above. GitHub Actions builds and publishes a pre-compiled image to `ghcr.io/mustafabayramguven/hydrocore-server:latest`, so your VPS can run it with `docker compose pull && docker compose up -d` and zero local compilation: see [server/README.md](server/README.md).
 
 ## Layout
 
 ```
-.github/workflows/build.yml   CI: test, build, verify, upload APK
-rust/                         Rust core (lib.rs + tests, jni_bridge.rs, build.rs)
-app/                          Android app (Kotlin, Compose, unit tests)
-server/                       Companion server (Rust, axum, SQLite, Dockerfile, compose)
+.github/workflows/build.yml          CI: test, build, verify, upload APK
+.github/workflows/server-docker.yml  CI: build & publish server Docker image to GHCR
+rust/                                Rust core (lib.rs + tests, jni_bridge.rs, build.rs)
+app/                                 Android app (Kotlin, Compose, unit tests)
+server/                              Companion server (Rust, axum, SQLite, Dockerfile, compose)
 ```

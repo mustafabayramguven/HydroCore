@@ -1,31 +1,34 @@
 # syntax=docker/dockerfile:1.7
 #
-# HydroCore companion server: builds straight from GitHub, so this file (plus
-# docker-compose.yml) is all you need on the host: no Rust, no database, no source tree.
-#
-#   docker compose up -d --build
+# HydroCore companion server multi-stage build.
+# Built in GitHub Actions (`.github/workflows/server-docker.yml`) and published to:
+#   ghcr.io/mustafabayramguven/hydrocore-server:latest
 #
 # The runtime image is `distroless/static` (no shell, no libc, ~2 MB) containing only the
-# statically linked binary. Alpine's native musl toolchain gives a fully static binary on
-# both amd64 and arm64 without cross-compilation.
+# statically linked musl binary.
 
 # ---------- Stage 1: build ----------------------------------------------------------
 FROM rust:1-alpine AS builder
 
-ARG HYDROCORE_REPO=https://github.com/mustafabayramguven/HydroCore.git
-ARG HYDROCORE_REF=main
-
-# git: fetch the sources. build-base/musl-dev: C toolchain for the bundled SQLite.
-RUN apk add --no-cache git build-base musl-dev
+# C toolchain for compiling the bundled SQLite (`rusqlite` with `bundled` feature).
+RUN apk add --no-cache build-base musl-dev
 
 WORKDIR /src
-# Re-run with `docker compose build --no-cache` (or change HYDROCORE_REF) to pick up new commits:
-# Docker cannot know the remote branch moved.
-RUN git clone --depth 1 --branch "${HYDROCORE_REF}" "${HYDROCORE_REPO}" hydrocore
 
-WORKDIR /src/hydrocore/server
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --locked \
+# Pre-build third-party dependencies in a separate layer so Buildx GHA cache (`type=gha`)
+# reuses compiled crates (`tokio`, `axum`, bundled `libsqlite3-sys`, etc.) across commits.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src static \
+ && echo "pub fn _cache() {}" > src/lib.rs \
+ && echo "fn main() {}" > src/main.rs \
+ && cargo build --release --locked \
+ && rm -rf src static
+
+# Copy server source code and embedded web dashboard assets from the repository context.
+COPY . .
+
+RUN touch src/lib.rs src/main.rs \
+ && cargo build --release --locked --bin hydrocore-server \
  && cp target/release/hydrocore-server /hydrocore-server \
  # An empty data dir owned by the distroless "nonroot" user (uid 65532). Docker copies it
  # (with ownership) into a fresh named volume mounted at /data.

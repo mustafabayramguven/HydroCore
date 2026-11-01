@@ -1,19 +1,14 @@
-# Start with:  docker compose up -d --build
-# Update with: docker compose build --no-cache && docker compose up -d
+# Deploy or update on the VPS (zero local compilation):
+#   docker compose pull && docker compose up -d
 services:
   hydrocore:
-    build:
-      context: .
-      args:
-        HYDROCORE_REPO: ${HYDROCORE_REPO:-https://github.com/mustafabayramguven/HydroCore.git}
-        HYDROCORE_REF: ${HYDROCORE_REF:-main}
-    image: hydrocore-server:latest
+    image: ghcr.io/mustafabayramguven/hydrocore-server:latest
     container_name: hydrocore-server
     restart: unless-stopped
     ports:
       - "${HYDROCORE_PORT:-8080}:8080"
     environment:
-      # Sent by the app as "Authorization: Bearer <token>" (the app's "API token" setting).
+      # Sent by the app as "Authorization: Bearer <token>" (the app's "Bearer Token" setting).
       # Empty = anyone who can reach the port may write data. Set one!
       HYDROCORE_API_TOKEN: ${HYDROCORE_API_TOKEN:-}
       # Browser login (HTTP Basic) for the dashboard and read API. Empty = open.
@@ -22,7 +17,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       # Named volume: the SQLite database (WAL files included) lives here and survives
-      # `docker compose down` and image rebuilds. Back it up by copying hydrocore.db.
+      # `docker compose down` and image updates. Back it up by copying hydrocore.db.
       - hydrocore-data:/data
     read_only: true
     cap_drop: [ALL]

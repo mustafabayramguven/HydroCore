@@ -3,17 +3,23 @@
 Self-hosted receiver and dashboard for the HydroCore Android app. One static Rust binary
 (axum + SQLite compiled in); the web UI is embedded in it and makes no external requests.
 
-## Run (only Docker needed)
+Pre-built Docker images are published to GitHub Container Registry (`ghcr.io/mustafabayramguven/hydrocore-server:latest`)
+by [`.github/workflows/server-docker.yml`](../.github/workflows/server-docker.yml), so your VPS never has to compile Rust.
+
+## Run on your VPS (zero compilation)
+
+Copy `docker-compose.yml` and `.env.example` to your server:
 
 ```sh
 cp .env.example .env        # set HYDROCORE_API_TOKEN and HYDROCORE_DASHBOARD_PASSWORD
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
-Only `Dockerfile`, `docker-compose.yml` (and optionally `.env`) are needed on the host: the
-builder stage clones this repository from GitHub (`HYDROCORE_REPO` / `HYDROCORE_REF`).
-The `server/` directory must therefore be pushed to that repository first.
-To pick up new commits: `docker compose build --no-cache && docker compose up -d`.
+To update to the latest image after pushing new commits:
+
+```sh
+docker compose pull && docker compose up -d
+```
 
 The database lives in the `hydrocore-data` named volume (`/data/hydrocore.db`).
 

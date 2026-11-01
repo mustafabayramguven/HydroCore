@@ -1,3 +1,5 @@
-# The build clones the sources from GitHub; nothing from the local directory is needed.
-*
-!Dockerfile
+target/
+.env
+*.db
+*.db-shm
+*.db-wal
